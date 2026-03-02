@@ -8,7 +8,7 @@ struct Command: ParsableCommand {
         commandName: "rmtrash",
         abstract: "Move files and directories to the trash.",
         discussion: "rmtrash is a small utility that will move the file to macOS's Trash rather than obliterating the file (as rm does).",
-        version: "0.7.0",
+        version: "0.8.0",
         shouldDisplay: true,
         subcommands: [],
         helpNames: .long,
@@ -60,6 +60,18 @@ struct Command: ParsableCommand {
 
     func parseArgs() throws -> Trash.Config {
         if paths.isEmpty {
+            if force {
+                // -f with no operands should succeed quietly
+                return Trash.Config(
+                    interactiveMode: .never,
+                    force: true,
+                    recursive: recursive,
+                    emptyDirs: emptyDirs,
+                    preserveRoot: preserveRoot,
+                    oneFileSystem: oneFileSystem,
+                    verbose: verbose
+                )
+            }
             throw Panic("missing operand\nTry 'rmtrash --help' for more information.")
         }
         var interactiveMode = Trash.Config.InteractiveMode(rawValue: ProcessInfo.processInfo.environment["RMTRASH_INTERACTIVE_MODE"] ?? "never") ?? .never
@@ -292,7 +304,7 @@ extension Trash {
         }
         if config.interactiveMode == .once {
             if !promptOnceCheck(paths: paths) {
-                return true
+                return false
             }
         }
         var success = true
@@ -387,6 +399,16 @@ extension Trash {
 
     private func permissionCheck(path: String) throws -> PermissionCheckResult {
         let url = URL(fileURLWithPath: path)
+
+        // Check for protected paths: . and ..
+        // Use the original path string to check for . and .. as they may be resolved by URL
+        // Also check for paths ending with . or .. (e.g., ../.., ../../, ./., etc.)
+        let normalizedPath = path.hasPrefix("/") ? path : "./" + path
+        if normalizedPath == "." || normalizedPath == ".." ||
+           normalizedPath.hasSuffix("/.") || normalizedPath.hasSuffix("/..") {
+            throw canNotRemovePanic(path: path, err: "Refusing to remove '\(path)' directory")
+        }
+
         // file exists check
         guard let fileType = fileManager.fileType(url) else {
             if !config.force {

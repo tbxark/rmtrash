@@ -470,7 +470,7 @@ final class RmTrashTests: XCTestCase {
 
         fileManager.createFileStructure(nodes: mockFiles, at: url)
 
-        // Test with no answer
+        // Test with no answer (user declines - should return failure)
         let noTrash = makeTrash(
             interactiveMode: .once,
             force: false,
@@ -478,7 +478,7 @@ final class RmTrashTests: XCTestCase {
             fileManager: fileManager,
             question: StaticAnswer(value: false)
         )
-        XCTAssertTrue(noTrash.removeMultiple(paths: ["./test1.txt", "./dir1"]))
+        XCTAssertFalse(noTrash.removeMultiple(paths: ["./test1.txt", "./dir1"]))
         assertFileStructure(fileManager, at: url, expectedFiles: mockFiles)
 
         // Test with yes answer
@@ -742,7 +742,33 @@ final class RmTrashTests: XCTestCase {
         )
         XCTAssertTrue(trashForce.removeMultiple(paths: ["./nonexistent.txt"]))
     }
-    
+
+    // MARK: - Protected Operands Tests
+
+    func testProtectedOperands() {
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+
+        let mockFiles: [FileNode] = [
+            .file(name: "test.txt", content: "test content")
+        ]
+        fileManager.createFileStructure(nodes: mockFiles, at: url)
+
+        let trash = makeTrash(force: false, recursive: true, fileManager: fileManager)
+
+        // Test basic protected paths
+        XCTAssertFalse(trash.removeMultiple(paths: ["."]))
+        XCTAssertFalse(trash.removeMultiple(paths: [".."]))
+
+        // Test extended protected paths
+        XCTAssertFalse(trash.removeMultiple(paths: ["./."]))
+        XCTAssertFalse(trash.removeMultiple(paths: ["../.."]))
+        XCTAssertFalse(trash.removeMultiple(paths: ["../../"]))
+
+        // Verify files still exist
+        assertFileStructure(fileManager, at: url, expectedFiles: mockFiles)
+    }
+
     // MARK: - Enhanced Test Infrastructure Tests
     
     func testSymbolicLinkChain() {
