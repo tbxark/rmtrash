@@ -24,7 +24,7 @@ struct Command: ParsableCommand {
     @Flag(name: .customShort("I"), help: "Prompt once before removing more than three files, or when removing recursively. This option is less intrusive than -i, but still gives protection against most mistakes.")
     var interactiveOnce: Bool = false
 
-    @Option(name: .customLong("interactive"), help: "Prompt according to WHEN: never, once (-I), or always (-i). If WHEN is not specified, then prompt always.")
+    @Option(name: .customLong("interactive"), help: "Prompt according to WHEN: never, once (-I), or always (-i). WHEN is required; use -i if you want the equivalent of '--interactive=always'.")
     var interactive: String?
 
     @Flag(name: [.customLong("one-file-system"), .customShort("x")], help: "When removing a hierarchy recursively, skip any directory that is on a file system different from that of the corresponding command line argument ")
@@ -55,6 +55,7 @@ struct Command: ParsableCommand {
             }
         } catch {
             Logger.error("rmtrash: \(error.localizedDescription)")
+            Command.exit(withError: ExitCode.failure)
         }
     }
 
@@ -107,7 +108,9 @@ public protocol FileManagerType {
 
     func isRootDir(_ url: URL) -> Bool
     func isEmptyDirectory(_ url: URL) -> Bool
-    func isCrossMountPoint(_ url: URL) throws -> Bool
+    // base is the command-line argument (or its parent during recursion). rm semantics
+    // dictate the comparison is against the command-line argument, not the CWD.
+    func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool
 
     func fileType(_ url: URL) -> FileAttributeType?
     func subpaths(atPath path: String, enumerator handler: (String) -> Bool)
@@ -125,36 +128,37 @@ extension FileManager: FileManagerType {
     }
 
     public func isEmptyDirectory(_ url: URL) -> Bool {
+        // If we cannot enumerate (e.g. permission denied), conservatively treat as non-empty
+        // so the caller refuses to remove it instead of silently proceeding.
         guard let enumerator = enumerator(at: url, includingPropertiesForKeys: nil, options: []) else {
-            return true
+            return false
         }
         return enumerator.nextObject() == nil
     }
 
-    public func isCrossMountPoint(_ url: URL) throws -> Bool {
-        let cur = URL(fileURLWithPath: currentDirectoryPath)
-        let curVol = try cur.resourceValues(forKeys: [.volumeURLKey, .volumeUUIDStringKey, .volumeIdentifierKey])
+    public func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool {
+        let baseVol = try base.resourceValues(forKeys: [.volumeURLKey, .volumeUUIDStringKey, .volumeIdentifierKey])
         let urlVol = try url.resourceValues(forKeys: [.volumeURLKey, .volumeUUIDStringKey, .volumeIdentifierKey])
-        
+
         // Primary comparison: Volume URL
-        if let curVolURL = curVol.volume, let urlVolURL = urlVol.volume {
-            if curVolURL == urlVolURL {
+        if let baseVolURL = baseVol.volume, let urlVolURL = urlVol.volume {
+            if baseVolURL == urlVolURL {
                 return false
             }
         }
-        
+
         // Secondary comparison: Volume UUID (more reliable for network drives and external storage)
-        if let curUUID = curVol.volumeUUIDString, let urlUUID = urlVol.volumeUUIDString {
-            if !curUUID.isEmpty && !urlUUID.isEmpty {
-                return curUUID != urlUUID
+        if let baseUUID = baseVol.volumeUUIDString, let urlUUID = urlVol.volumeUUIDString {
+            if !baseUUID.isEmpty && !urlUUID.isEmpty {
+                return baseUUID != urlUUID
             }
         }
-        
+
         // Tertiary comparison: Volume identifier (fallback for special cases)
-        if let curID = curVol.volumeIdentifier, let urlID = urlVol.volumeIdentifier {
-            return !curID.isEqual(urlID)
+        if let baseID = baseVol.volumeIdentifier, let urlID = urlVol.volumeIdentifier {
+            return !baseID.isEqual(urlID)
         }
-        
+
         // Conservative fallback: assume different volumes if we can't determine
         return true
     }
@@ -303,25 +307,28 @@ extension Trash {
             return true
         }
         if config.interactiveMode == .once {
+            // User declining the once-prompt is a normal cancellation, not a failure.
             if !promptOnceCheck(paths: paths) {
-                return false
+                return true
             }
         }
         var success = true
         for path in paths {
-            success = removeOne(path: path) && success
+            // Command-line arguments have no enclosing base; pass nil so they aren't
+            // subject to cross-mount checks against themselves.
+            success = removeOne(path: path, base: nil) && success
         }
         return success
     }
 
-    @discardableResult private func removeOne(path: String) -> Bool {
+    @discardableResult private func removeOne(path: String, base: URL?) -> Bool {
         do {
-            guard case .info(url: let url, isDir: let isDir) = try permissionCheck(path: path) else {
+            guard case .info(url: let url, isDir: let isDir) = try permissionCheck(path: path, base: base) else {
                 return true
             }
             switch (config.interactiveMode, isDir) {
             case (.always, true):
-                removeDirectory(path)
+                removeDirectory(path, rootURL: url)
             case (.always, false):
                 if question.ask("remove file \(path)?") {
                     try fileManager.trashItem(at: url)
@@ -331,14 +338,15 @@ extension Trash {
             }
             return true
         } catch {
-            if config.verbose || !config.force { // force will ignore the error
-                Logger.error("rmtrash: \(error.localizedDescription)")
-            }
+            // Errors that survive permissionCheck (e.g. permission denied, cross-device)
+            // are always reported, matching rm's behavior where -f only silences
+            // "does not exist" errors (already handled via .skip in permissionCheck).
+            Logger.error("rmtrash: \(error.localizedDescription)")
         }
         return false
     }
 
-    private func removeDirectory(_ path: String) {
+    private func removeDirectory(_ path: String, rootURL: URL) {
         let url = URL(fileURLWithPath: path)
         // when directory is empty, no examine needed
         if fileManager.isEmptyDirectory(url) {
@@ -351,7 +359,8 @@ extension Trash {
 
         // remove all files or directories in the directory
         fileManager.subpaths(atPath: path, enumerator: { subPath in
-            self.removeOne(path: subPath)
+            // Children are compared against the cmd-line root for --one-file-system.
+            self.removeOne(path: subPath, base: rootURL)
         })
 
         // try to remove the directory after all files in it are removed
@@ -366,7 +375,7 @@ extension Trash {
         conf.recursive = false          // no recursive anymore
         conf.emptyDirs = true           // but can remove empty directories
         conf.interactiveMode = .never   // and no interactive mode, because did interactive before
-        Trash(config: conf, question: question, fileManager: fileManager).removeOne(path: path)
+        Trash(config: conf, question: question, fileManager: fileManager).removeOne(path: path, base: nil)
     }
 }
 
@@ -397,17 +406,18 @@ extension Trash {
         }
     }
 
-    private func permissionCheck(path: String) throws -> PermissionCheckResult {
-        let url = URL(fileURLWithPath: path)
-
-        // Check for protected paths: . and ..
-        // Use the original path string to check for . and .. as they may be resolved by URL
-        // Also check for paths ending with . or .. (e.g., ../.., ../../, ./., etc.)
-        let normalizedPath = path.hasPrefix("/") ? path : "./" + path
-        if normalizedPath == "." || normalizedPath == ".." ||
-           normalizedPath.hasSuffix("/.") || normalizedPath.hasSuffix("/..") {
-            throw canNotRemovePanic(path: path, err: "Refusing to remove '\(path)' directory")
+    private func permissionCheck(path: String, base: URL?) throws -> PermissionCheckResult {
+        // Protected paths check: refuse to remove '.' and '..' by basename,
+        // matching GNU/BSD rm. This also covers trailing-slash variants like
+        // "foo/./", "foo/../" because we strip a trailing slash before taking
+        // the last path component.
+        let trimmed = path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+        let basename = (trimmed as NSString).lastPathComponent
+        if basename == "." || basename == ".." {
+            throw canNotRemovePanic(path: path, err: "Refusing to remove '.' or '..' directory")
         }
+
+        let url = URL(fileURLWithPath: path)
 
         // file exists check
         guard let fileType = fileManager.fileType(url) else {
@@ -419,9 +429,11 @@ extension Trash {
 
         let isDir = fileType == .typeDirectory
 
-        // cross mount point check
-        if config.oneFileSystem {
-            let cross = try fileManager.isCrossMountPoint(url)
+        // cross mount point check: only applies to descendants of a command-line
+        // argument. The command-line argument itself (base == nil) is the reference
+        // point, so it can never be "cross-mount" relative to itself.
+        if config.oneFileSystem, let base = base {
+            let cross = try fileManager.isCrossMountPoint(url, against: base)
             if cross {
                 throw canNotRemovePanic(path: path, err: "Cross-device link")
             }

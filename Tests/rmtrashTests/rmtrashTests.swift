@@ -207,42 +207,51 @@ struct FileSystemTestUtilities {
     /// Volume and mount point simulation utilities
     struct VolumeSimulator {
         
-        /// Mock file manager for simulating different volumes
+        /// Mock file manager for simulating different volumes. Volumes are assigned by
+        /// path prefix; isCrossMountPoint compares the volume of `url` against the volume
+        /// of the supplied `base`, exercising the rm semantics of "compare against the
+        /// command-line argument".
         class MockVolumeFileManager: FileManagerType {
             private let baseFileManager = FileManager()
             private var volumeMap: [String: String] = [:]
-            private var crossMountPoints: Set<String> = []
-            
+
             func setVolume(_ volumeId: String, for path: String) {
                 volumeMap[path] = volumeId
             }
-            
-            func setCrossMountPoint(_ path: String) {
-                crossMountPoints.insert(path)
+
+            private func volume(for url: URL) -> String? {
+                let path = url.standardizedFileURL.path
+                // Longest-prefix match so /a/b/c picks /a/b over /a.
+                return volumeMap
+                    .filter { path == $0.key || path.hasPrefix($0.key.hasSuffix("/") ? $0.key : $0.key + "/") }
+                    .max(by: { $0.key.count < $1.key.count })?
+                    .value
             }
-            
+
             func trashItem(at url: URL) throws {
                 try baseFileManager.trashItem(at: url)
             }
-            
+
             func isRootDir(_ url: URL) -> Bool {
                 return baseFileManager.isRootDir(url)
             }
-            
+
             func isEmptyDirectory(_ url: URL) -> Bool {
                 return baseFileManager.isEmptyDirectory(url)
             }
-            
-            func isCrossMountPoint(_ url: URL) throws -> Bool {
-                let path = url.standardizedFileURL.path
-                return crossMountPoints.contains(path) || 
-                       crossMountPoints.contains { path.hasPrefix($0) }
+
+            func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool {
+                let urlVol = volume(for: url)
+                let baseVol = volume(for: base)
+                // If neither path is mapped, treat as same volume (no info).
+                if urlVol == nil && baseVol == nil { return false }
+                return urlVol != baseVol
             }
-            
+
             func fileType(_ url: URL) -> FileAttributeType? {
                 return baseFileManager.fileType(url)
             }
-            
+
             func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
                 baseFileManager.subpaths(atPath: path, enumerator: handler)
             }
@@ -272,11 +281,7 @@ struct FileSystemTestUtilities {
             mockFM.setVolume("vol1", for: "/volume1")
             mockFM.setVolume("vol2", for: "/volume2")
             mockFM.setVolume("vol3", for: "/mount_point")
-            
-            // Set cross-mount points
-            mockFM.setCrossMountPoint("/volume2")
-            mockFM.setCrossMountPoint("/mount_point")
-            
+
             return (mockFM, nodes)
         }
         
@@ -299,8 +304,7 @@ struct FileSystemTestUtilities {
             // Configure as network mount (different volume)
             mockFM.setVolume("local_vol", for: "/local")
             mockFM.setVolume("network_vol", for: "/network_mount")
-            mockFM.setCrossMountPoint("/network_mount")
-            
+
             return (mockFM, nodes)
         }
     }
@@ -470,7 +474,8 @@ final class RmTrashTests: XCTestCase {
 
         fileManager.createFileStructure(nodes: mockFiles, at: url)
 
-        // Test with no answer (user declines - should return failure)
+        // Test with no answer (user declines once-prompt - this is a normal cancellation,
+        // not a failure, so rm and rmtrash both exit 0).
         let noTrash = makeTrash(
             interactiveMode: .once,
             force: false,
@@ -478,7 +483,7 @@ final class RmTrashTests: XCTestCase {
             fileManager: fileManager,
             question: StaticAnswer(value: false)
         )
-        XCTAssertFalse(noTrash.removeMultiple(paths: ["./test1.txt", "./dir1"]))
+        XCTAssertTrue(noTrash.removeMultiple(paths: ["./test1.txt", "./dir1"]))
         assertFileStructure(fileManager, at: url, expectedFiles: mockFiles)
 
         // Test with yes answer
@@ -769,6 +774,29 @@ final class RmTrashTests: XCTestCase {
         assertFileStructure(fileManager, at: url, expectedFiles: mockFiles)
     }
 
+    func testProtectedOperandsTrailingSlash() {
+        // GNU rm refuses '.' and '..' regardless of trailing slashes.
+        // basename-based detection covers foo/./, foo/../, /., /.., etc.
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+
+        let mockFiles: [FileNode] = [
+            .file(name: "test.txt", content: "test content")
+        ]
+        fileManager.createFileStructure(nodes: mockFiles, at: url)
+
+        let trash = makeTrash(force: false, recursive: true, fileManager: fileManager)
+
+        XCTAssertFalse(trash.removeMultiple(paths: ["./"]))
+        XCTAssertFalse(trash.removeMultiple(paths: ["../"]))
+        XCTAssertFalse(trash.removeMultiple(paths: ["foo/./"]))
+        XCTAssertFalse(trash.removeMultiple(paths: ["foo/../"]))
+        XCTAssertFalse(trash.removeMultiple(paths: ["/."]))
+        XCTAssertFalse(trash.removeMultiple(paths: ["/.."]))
+
+        assertFileStructure(fileManager, at: url, expectedFiles: mockFiles)
+    }
+
     // MARK: - Enhanced Test Infrastructure Tests
     
     func testSymbolicLinkChain() {
@@ -866,33 +894,69 @@ final class RmTrashTests: XCTestCase {
         XCTAssertTrue(trash.removeMultiple(paths: ["./relative.link", "./absolute.link"]))
     }
     
-    func testVolumeSimulation() {
+    func testVolumeSimulation() throws {
+        // Sanity-check the mock's volume bookkeeping: a URL on a different volume
+        // than the base should be reported as cross-mount; a URL on the same volume
+        // as the base (even if the *CWD* is on yet another volume) should not.
+        // This protects against the regression of comparing against CWD instead of
+        // the command-line argument.
+        let mockFM = FileSystemTestUtilities.VolumeSimulator.MockVolumeFileManager()
+        mockFM.setVolume("volA", for: "/baseA")
+        mockFM.setVolume("volA", for: "/baseA/child.txt")
+        mockFM.setVolume("volB", for: "/baseB")
+
+        let baseA = URL(fileURLWithPath: "/baseA")
+        let baseB = URL(fileURLWithPath: "/baseB")
+        let childA = URL(fileURLWithPath: "/baseA/child.txt")
+
+        // Same volume relative to the supplied base.
+        XCTAssertFalse(try mockFM.isCrossMountPoint(childA, against: baseA))
+        // Different volume relative to the supplied base.
+        XCTAssertTrue(try mockFM.isCrossMountPoint(childA, against: baseB))
+        // Base compared against itself is never cross-mount.
+        XCTAssertFalse(try mockFM.isCrossMountPoint(baseA, against: baseA))
+    }
+
+    func testOneFileSystemSkipsCrossMountDescendants() throws {
+        // End-to-end check: with --one-file-system, descendants on a different
+        // volume than the command-line root must be refused, while same-volume
+        // descendants proceed. Uses interactive=always so removeDirectory walks
+        // children one-by-one (the only path that triggers per-child cross-mount
+        // checks).
         let (fileManager, url) = FileManager.createTempDirectory()
         defer { try? fileManager.removeItem(at: url) }
-        
-        // Test volume simulation
-        let (mockFM, volumeNodes) = FileSystemTestUtilities.VolumeSimulator.createMultiVolumeScenario()
-        fileManager.createFileStructure(nodes: volumeNodes, at: url)
-        
-        // Test with oneFileSystem flag - should respect volume boundaries
-        let _ = makeTrash(
-            force: true,
+
+        let mockFiles: [FileNode] = [
+            .directory(name: "root", sub: [
+                .file(name: "same_vol.txt", content: "a"),
+                .file(name: "cross_vol.txt", content: "b")
+            ])
+        ]
+        fileManager.createFileStructure(nodes: mockFiles, at: url)
+
+        let rootPath = url.appendingPathComponent("root").path
+        let sameVolPath = url.appendingPathComponent("root/same_vol.txt").path
+        let crossVolPath = url.appendingPathComponent("root/cross_vol.txt").path
+
+        let mockFM = FileSystemTestUtilities.VolumeSimulator.MockVolumeFileManager()
+        mockFM.setVolume("volRoot", for: rootPath)
+        mockFM.setVolume("volRoot", for: sameVolPath)
+        mockFM.setVolume("volOther", for: crossVolPath)
+
+        let trash = makeTrash(
+            interactiveMode: .always,
+            force: false,
             recursive: true,
             oneFileSystem: true,
-            fileManager: mockFM
+            fileManager: mockFM,
+            question: StaticAnswer(value: true)
         )
-        
-        // This test verifies the infrastructure is in place for volume simulation
-        XCTAssertNotNil(mockFM)
-        
-        // Verify the mock file manager can detect cross-mount points
-        // The mock is configured to treat "/volume2" as a cross-mount point
-        let testURL = URL(fileURLWithPath: "/volume2")
-        XCTAssertTrue(try mockFM.isCrossMountPoint(testURL))
-        
-        // Test that a non-cross-mount point returns false
-        let localURL = URL(fileURLWithPath: "/local")
-        XCTAssertFalse(try mockFM.isCrossMountPoint(localURL))
+        // Returns false because cross_vol.txt fails the cross-mount check.
+        _ = trash.removeMultiple(paths: [rootPath])
+
+        // The cross-mount file is preserved, the same-volume file is gone.
+        XCTAssertEqual(mockFM.fileType(URL(fileURLWithPath: crossVolPath)), .typeRegular)
+        XCTAssertNil(mockFM.fileType(URL(fileURLWithPath: sameVolPath)))
     }
     
     func testDeepHierarchyGeneration() {
@@ -990,25 +1054,20 @@ final class FileManagerTests: XCTestCase {
     func testCrossMountPointDetection() throws {
         let (fileManager, url) = FileManager.createTempDirectory()
         defer { try? fileManager.removeItem(at: url) }
-        
-        // Test same volume detection
+
+        // Same volume against itself / its descendants
         let subDir = url.appendingPathComponent("subdir")
         try fileManager.createDirectory(at: subDir, withIntermediateDirectories: true, attributes: nil)
-        
-        // Files on the same volume should not be cross-mount points
-        XCTAssertFalse(try fileManager.isCrossMountPoint(subDir))
-        XCTAssertFalse(try fileManager.isCrossMountPoint(url))
-        
-        // Test with root directory (different volume in most cases)
+
+        XCTAssertFalse(try fileManager.isCrossMountPoint(subDir, against: url))
+        XCTAssertFalse(try fileManager.isCrossMountPoint(url, against: url))
+
+        // Cross-volume check only runs if tmp and / are actually on different volumes.
         let rootURL = URL(fileURLWithPath: "/")
-        
-        // Get volume info to check if we're actually on different volumes
         let tempVol = try url.resourceValues(forKeys: [.volumeURLKey])
         let rootVol = try rootURL.resourceValues(forKeys: [.volumeURLKey])
-        
-        // Only test cross-mount if we're actually on different volumes
         if tempVol.volume != rootVol.volume {
-            XCTAssertTrue(try fileManager.isCrossMountPoint(rootURL))
+            XCTAssertTrue(try fileManager.isCrossMountPoint(rootURL, against: url))
         }
     }
     
