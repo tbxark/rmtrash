@@ -64,6 +64,61 @@ struct StaticAnswer: Question {
     }
 }
 
+/// Records every prompt it is asked, so tests can assert whether (and how often)
+/// the user was prompted.
+final class RecordingQuestion: Question {
+    let answer: Bool
+    private(set) var asked: [String] = []
+    init(answer: Bool) { self.answer = answer }
+    func ask(_ message: String) -> Bool {
+        asked.append(message)
+        return answer
+    }
+}
+
+/// A `FileManagerType` for deterministic removal tests. Inspection (type,
+/// emptiness, enumeration) runs against the real filesystem, but "trashing"
+/// permanently deletes the item — so tests never pollute the user's real Trash —
+/// and can be told to fail for specific basenames to exercise error-handling
+/// paths. Enumeration is sorted so tests can reason about child ordering.
+final class RecordingFileManager: FileManagerType {
+    private let real = FileManager()
+
+    /// Basenames for which `trashItem` throws instead of removing.
+    var failing: Set<String> = []
+    /// Basenames for which `trashItem` was attempted, in call order.
+    private(set) var attempted: [String] = []
+    /// Basenames actually removed, in call order.
+    private(set) var removed: [String] = []
+    /// Absolute paths that should be reported as the filesystem root.
+    var roots: Set<String> = []
+
+    func trashItem(at url: URL) throws {
+        let name = url.lastPathComponent
+        attempted.append(name)
+        if failing.contains(name) {
+            throw Panic("simulated failure removing \(name)")
+        }
+        try real.removeItem(at: url)
+        removed.append(name)
+    }
+
+    func isRootDir(_ url: URL) -> Bool {
+        roots.contains(url.standardizedFileURL.path) || real.isRootDir(url)
+    }
+    func isEmptyDirectory(_ url: URL) -> Bool { real.isEmptyDirectory(url) }
+    func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool { false }
+    func fileType(_ url: URL) -> FileAttributeType? { real.fileType(url) }
+
+    func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
+        guard let names = try? real.contentsOfDirectory(atPath: path) else { return }
+        for name in names.sorted() {
+            let child = URL(fileURLWithPath: path).appendingPathComponent(name).path
+            if !handler(child) { break }
+        }
+    }
+}
+
 extension FileManager {
     func currentFileStructure(at url: URL) -> FileNode? {
         guard let attr = try? attributesOfItem(atPath: url.path),
@@ -229,7 +284,8 @@ struct FileSystemTestUtilities {
             }
 
             func trashItem(at url: URL) throws {
-                try baseFileManager.trashItem(at: url)
+                // Test double: delete outright so tests never pollute the real Trash.
+                try baseFileManager.removeItem(at: url)
             }
 
             func isRootDir(_ url: URL) -> Bool {
@@ -255,57 +311,6 @@ struct FileSystemTestUtilities {
             func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
                 baseFileManager.subpaths(atPath: path, enumerator: handler)
             }
-        }
-        
-        /// Create a test scenario with multiple volumes
-        static func createMultiVolumeScenario() -> (fileManager: MockVolumeFileManager, nodes: [FileNode]) {
-            let mockFM = MockVolumeFileManager()
-            
-            let nodes: [FileNode] = [
-                FileNode.directory(name: "volume1", sub: [
-                    FileNode.file(name: "file1.txt", content: "volume1 content"),
-                    FileNode.directory(name: "subdir", sub: [
-                        FileNode.file(name: "nested.txt", content: "nested in volume1")
-                    ])
-                ]),
-                FileNode.directory(name: "volume2", sub: [
-                    FileNode.file(name: "file2.txt", content: "volume2 content"),
-                    FileNode.symbolicLink(name: "cross_vol_link.link", target: "../volume1/file1.txt")
-                ]),
-                FileNode.directory(name: "mount_point", sub: [
-                    FileNode.file(name: "mounted_file.txt", content: "mounted content")
-                ])
-            ]
-            
-            // Configure volume mappings
-            mockFM.setVolume("vol1", for: "/volume1")
-            mockFM.setVolume("vol2", for: "/volume2")
-            mockFM.setVolume("vol3", for: "/mount_point")
-
-            return (mockFM, nodes)
-        }
-        
-        /// Create a scenario with network mount simulation
-        static func createNetworkMountScenario() -> (fileManager: MockVolumeFileManager, nodes: [FileNode]) {
-            let mockFM = MockVolumeFileManager()
-            
-            let nodes: [FileNode] = [
-                FileNode.directory(name: "local", sub: [
-                    FileNode.file(name: "local_file.txt", content: "local content")
-                ]),
-                FileNode.directory(name: "network_mount", sub: [
-                    FileNode.file(name: "remote_file.txt", content: "remote content"),
-                    FileNode.directory(name: "remote_dir", sub: [
-                        FileNode.file(name: "deep_remote.txt", content: "deep remote content")
-                    ])
-                ])
-            ]
-            
-            // Configure as network mount (different volume)
-            mockFM.setVolume("local_vol", for: "/local")
-            mockFM.setVolume("network_vol", for: "/network_mount")
-
-            return (mockFM, nodes)
         }
     }
     
@@ -748,6 +753,134 @@ final class RmTrashTests: XCTestCase {
         XCTAssertTrue(trashForce.removeMultiple(paths: ["./nonexistent.txt"]))
     }
 
+    // MARK: - Interactive Directory Removal
+
+    /// Building block for the interactive-removal specs below: a directory with
+    /// three regular files, driven in `.always` mode answering "yes" to every
+    /// prompt, using `RecordingFileManager` so failures can be injected
+    /// deterministically without touching the real Trash.
+    private func makeInteractiveDirScenario(
+        failing: Set<String> = []
+    ) -> (mock: RecordingFileManager, dirPath: String, cleanup: () -> Void) {
+        let (real, url) = FileManager.createTempDirectory()
+        real.createFileStructure(nodes: [
+            .directory(name: "dir", sub: [
+                .file(name: "a.txt", content: "a"),
+                .file(name: "b.txt", content: "b"),
+                .file(name: "c.txt", content: "c")
+            ])
+        ], at: url)
+        let mock = RecordingFileManager()
+        mock.failing = failing
+        return (mock, url.appendingPathComponent("dir").path, { try? real.removeItem(at: url) })
+    }
+
+    /// Correctness: when every item is removable, the whole directory is trashed
+    /// and the operation reports success.
+    func testInteractiveDirectoryRemovesEverythingAndReportsSuccess() {
+        let (mock, dirPath, cleanup) = makeInteractiveDirScenario()
+        defer { cleanup() }
+
+        let trash = makeTrash(interactiveMode: .always, force: false, recursive: true,
+                              fileManager: mock, question: StaticAnswer(value: true))
+
+        XCTAssertTrue(trash.removeMultiple(paths: [dirPath]))
+        XCTAssertEqual(Set(mock.removed), ["a.txt", "b.txt", "c.txt", "dir"])
+        XCTAssertNil(mock.fileType(URL(fileURLWithPath: dirPath)))
+    }
+
+    /// Accuracy: if any item cannot be removed, the operation reports failure
+    /// (exit status), instead of masking the error as success.
+    func testInteractiveDirectoryReportsFailureWhenAnItemCannotBeRemoved() {
+        let (mock, dirPath, cleanup) = makeInteractiveDirScenario(failing: ["b.txt"])
+        defer { cleanup() }
+
+        let trash = makeTrash(interactiveMode: .always, force: false, recursive: true,
+                              fileManager: mock, question: StaticAnswer(value: true))
+
+        XCTAssertFalse(trash.removeMultiple(paths: [dirPath]))
+    }
+
+    /// Completeness: a failure on one child must not abort the walk. Every sibling
+    /// is still visited and the removable ones are removed. The failing file
+    /// ("a.txt") sorts first, so a premature stop would leave b/c untouched.
+    func testInteractiveDirectoryVisitsEveryChildEvenWhenOneFails() {
+        let (mock, dirPath, cleanup) = makeInteractiveDirScenario(failing: ["a.txt"])
+        defer { cleanup() }
+
+        let trash = makeTrash(interactiveMode: .always, force: false, recursive: true,
+                              fileManager: mock, question: StaticAnswer(value: true))
+
+        _ = trash.removeMultiple(paths: [dirPath])
+
+        XCTAssertEqual(Set(mock.attempted), ["a.txt", "b.txt", "c.txt"])
+        XCTAssertEqual(Set(mock.removed), ["b.txt", "c.txt"])
+    }
+
+    // MARK: - Interactive Once Threshold
+
+    /// A directory containing `names` as regular files, plus a mock that removes
+    /// without touching the real Trash.
+    private func makeFilesScenario(_ names: [String]) -> (mock: RecordingFileManager, paths: [String], cleanup: () -> Void) {
+        let (real, url) = FileManager.createTempDirectory()
+        for name in names {
+            real.createFile(atPath: url.appendingPathComponent(name).path, contents: Data(), attributes: nil)
+        }
+        let mock = RecordingFileManager()
+        let paths = names.map { url.appendingPathComponent($0).path }
+        return (mock, paths, { try? real.removeItem(at: url) })
+    }
+
+    /// `-I` is the light-touch guard: three or fewer plain files are removed
+    /// without any confirmation.
+    func testInteractiveOnceDoesNotPromptForThreeOrFewerFiles() {
+        let (mock, paths, cleanup) = makeFilesScenario(["a.txt", "b.txt", "c.txt"])
+        defer { cleanup() }
+
+        let q = RecordingQuestion(answer: true)
+        let trash = makeTrash(interactiveMode: .once, force: false, fileManager: mock, question: q)
+
+        XCTAssertTrue(trash.removeMultiple(paths: paths))
+        XCTAssertTrue(q.asked.isEmpty)
+        XCTAssertEqual(Set(mock.removed), ["a.txt", "b.txt", "c.txt"])
+    }
+
+    /// More than three files trips a single confirmation; declining it cancels
+    /// the whole batch (a normal, successful cancellation).
+    func testInteractiveOncePromptsOnceForMoreThanThreeFiles() {
+        let (mock, paths, cleanup) = makeFilesScenario(["a.txt", "b.txt", "c.txt", "d.txt"])
+        defer { cleanup() }
+
+        let q = RecordingQuestion(answer: false)
+        let trash = makeTrash(interactiveMode: .once, force: false, fileManager: mock, question: q)
+
+        XCTAssertTrue(trash.removeMultiple(paths: paths))
+        XCTAssertEqual(q.asked.count, 1)
+        XCTAssertTrue(mock.removed.isEmpty)
+    }
+
+    // MARK: - Preserve Root
+
+    /// `--preserve-root` (the default) refuses the filesystem root; turning it off
+    /// allows the removal. Uses a mock root so no real directory is at risk.
+    func testPreserveRootRefusesRootDirectory() {
+        let (real, url) = FileManager.createTempDirectory()
+        defer { try? real.removeItem(at: url) }
+        let dir = url.appendingPathComponent("rootlike")
+        try? real.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
+
+        let mock = RecordingFileManager()
+        mock.roots = [dir.standardizedFileURL.path]
+
+        let guarded = makeTrash(recursive: true, preserveRoot: true, fileManager: mock)
+        XCTAssertFalse(guarded.removeMultiple(paths: [dir.path]))
+        XCTAssertEqual(mock.fileType(dir), .typeDirectory)
+
+        let unguarded = makeTrash(recursive: true, preserveRoot: false, fileManager: mock)
+        XCTAssertTrue(unguarded.removeMultiple(paths: [dir.path]))
+        XCTAssertNil(mock.fileType(dir))
+    }
+
     // MARK: - Protected Operands Tests
 
     func testProtectedOperands() {
@@ -917,22 +1050,20 @@ final class RmTrashTests: XCTestCase {
         XCTAssertFalse(try mockFM.isCrossMountPoint(baseA, against: baseA))
     }
 
-    func testOneFileSystemSkipsCrossMountDescendants() throws {
-        // End-to-end check: with --one-file-system, descendants on a different
-        // volume than the command-line root must be refused, while same-volume
-        // descendants proceed. Uses interactive=always so removeDirectory walks
-        // children one-by-one (the only path that triggers per-child cross-mount
-        // checks).
+    func testOneFileSystemRefusesDirectorySpanningMountPoint() throws {
+        // With --one-file-system, a command-line directory that spans a mount
+        // point is refused as a whole: nothing beneath it is removed, so a nested
+        // volume is never swept into the Trash. This is exercised on the common
+        // non-interactive path (`rmtrash -rfx dir`) — not just interactive walks.
         let (fileManager, url) = FileManager.createTempDirectory()
         defer { try? fileManager.removeItem(at: url) }
 
-        let mockFiles: [FileNode] = [
+        fileManager.createFileStructure(nodes: [
             .directory(name: "root", sub: [
                 .file(name: "same_vol.txt", content: "a"),
                 .file(name: "cross_vol.txt", content: "b")
             ])
-        ]
-        fileManager.createFileStructure(nodes: mockFiles, at: url)
+        ], at: url)
 
         let rootPath = url.appendingPathComponent("root").path
         let sameVolPath = url.appendingPathComponent("root/same_vol.txt").path
@@ -944,19 +1075,52 @@ final class RmTrashTests: XCTestCase {
         mockFM.setVolume("volOther", for: crossVolPath)
 
         let trash = makeTrash(
-            interactiveMode: .always,
-            force: false,
+            interactiveMode: .never,
+            force: true,
             recursive: true,
             oneFileSystem: true,
             fileManager: mockFM,
             question: StaticAnswer(value: true)
         )
-        // Returns false because cross_vol.txt fails the cross-mount check.
-        _ = trash.removeMultiple(paths: [rootPath])
 
-        // The cross-mount file is preserved, the same-volume file is gone.
+        XCTAssertFalse(trash.removeMultiple(paths: [rootPath]))
+        // Nothing removed: both files and the directory itself remain.
         XCTAssertEqual(mockFM.fileType(URL(fileURLWithPath: crossVolPath)), .typeRegular)
-        XCTAssertNil(mockFM.fileType(URL(fileURLWithPath: sameVolPath)))
+        XCTAssertEqual(mockFM.fileType(URL(fileURLWithPath: sameVolPath)), .typeRegular)
+        XCTAssertEqual(mockFM.fileType(URL(fileURLWithPath: rootPath)), .typeDirectory)
+    }
+
+    func testOneFileSystemAllowsSingleVolumeDirectory() throws {
+        // --one-file-system must not block a directory that lives entirely on one
+        // volume; the whole tree is removed normally.
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+
+        fileManager.createFileStructure(nodes: [
+            .directory(name: "root", sub: [
+                .file(name: "a.txt", content: "a"),
+                .directory(name: "sub", sub: [
+                    .file(name: "b.txt", content: "b")
+                ])
+            ])
+        ], at: url)
+
+        let rootPath = url.appendingPathComponent("root").path
+        let mockFM = FileSystemTestUtilities.VolumeSimulator.MockVolumeFileManager()
+        // The whole subtree resolves to volRoot via longest-prefix match.
+        mockFM.setVolume("volRoot", for: rootPath)
+
+        let trash = makeTrash(
+            interactiveMode: .never,
+            force: true,
+            recursive: true,
+            oneFileSystem: true,
+            fileManager: mockFM,
+            question: StaticAnswer(value: true)
+        )
+
+        XCTAssertTrue(trash.removeMultiple(paths: [rootPath]))
+        XCTAssertNil(mockFM.fileType(URL(fileURLWithPath: rootPath)))
     }
     
     func testDeepHierarchyGeneration() {
@@ -1080,6 +1244,49 @@ final class FileManagerTests: XCTestCase {
         // Basic volume info should be available
         XCTAssertNotNil(resourceValues.volume)
         XCTAssertNotNil(resourceValues.volumeName)
+    }
+}
+
+final class CommandParsingTests: XCTestCase {
+
+    private func config(_ args: [String]) throws -> Trash.Config {
+        try Command.parse(args).parseArgs()
+    }
+
+    func testMissingOperandThrows() {
+        XCTAssertThrowsError(try config([]))
+    }
+
+    func testForceWithNoOperandsSucceedsQuietly() throws {
+        let c = try config(["-f"])
+        XCTAssertTrue(c.force)
+        XCTAssertEqual(c.interactiveMode, .never)
+    }
+
+    func testInteractiveFlagsMapToModes() throws {
+        XCTAssertEqual(try config(["x"]).interactiveMode, .never)
+        XCTAssertEqual(try config(["-i", "x"]).interactiveMode, .always)
+        XCTAssertEqual(try config(["-I", "x"]).interactiveMode, .once)
+        XCTAssertEqual(try config(["--interactive=once", "x"]).interactiveMode, .once)
+        XCTAssertEqual(try config(["--interactive=always", "x"]).interactiveMode, .always)
+    }
+
+    func testForceOverridesInteractive() throws {
+        // -f silences prompts even when combined with -i.
+        XCTAssertEqual(try config(["-f", "-i", "x"]).interactiveMode, .never)
+    }
+
+    func testInvalidInteractiveValueIsRejected() {
+        XCTAssertThrowsError(try Command.parse(["--interactive=nope", "x"]))
+    }
+
+    func testBooleanFlagsMapToConfig() throws {
+        let c = try config(["-r", "-d", "-x", "x"])
+        XCTAssertTrue(c.recursive)
+        XCTAssertTrue(c.emptyDirs)
+        XCTAssertTrue(c.oneFileSystem)
+        XCTAssertTrue(c.preserveRoot) // on by default
+        XCTAssertFalse(try config(["--no-preserve-root", "x"]).preserveRoot)
     }
 }
 

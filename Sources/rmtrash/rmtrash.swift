@@ -4,7 +4,7 @@ import ArgumentParser
 @main
 struct Command: ParsableCommand {
 
-    static var configuration: CommandConfiguration = CommandConfiguration(
+    static let configuration: CommandConfiguration = CommandConfiguration(
         commandName: "rmtrash",
         abstract: "Move files and directories to the trash.",
         discussion: "rmtrash is a small utility that will move the file to macOS's Trash rather than obliterating the file (as rm does).",
@@ -25,7 +25,7 @@ struct Command: ParsableCommand {
     var interactiveOnce: Bool = false
 
     @Option(name: .customLong("interactive"), help: "Prompt according to WHEN: never, once (-I), or always (-i). WHEN is required; use -i if you want the equivalent of '--interactive=always'.")
-    var interactive: String?
+    var interactive: Trash.Config.InteractiveMode?
 
     @Flag(name: [.customLong("one-file-system"), .customShort("x")], help: "When removing a hierarchy recursively, skip any directory that is on a file system different from that of the corresponding command line argument ")
     var oneFileSystem: Bool = false
@@ -83,11 +83,7 @@ struct Command: ParsableCommand {
         } else if interactiveOnce {
             interactiveMode = .once
         } else if let interactive = interactive {
-            if let mode = Trash.Config.InteractiveMode(rawValue: interactive) {
-                interactiveMode = mode
-            } else {
-                throw Panic("invalid argument for --interactive: \(interactive)\nTry 'rmtrash --help' for more information.")
-            }
+            interactiveMode = interactive
         }
         return Trash.Config(
             interactiveMode: interactiveMode,
@@ -174,25 +170,15 @@ extension FileManager: FileManagerType {
     }
 
     public func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
-        if #available(macOS 10.15, *) {
-            if  let enumerator = self.enumerator(at: URL(fileURLWithPath: path),
-                                                        includingPropertiesForKeys: [],
-                                                        options: [.skipsSubdirectoryDescendants, .producesRelativePathURLs]) {
-                for case let fileURL as URL in enumerator {
-                    let subPath = URL(fileURLWithPath: path).appendingPathComponent(fileURL.relativePath).relativePath
-                    if !handler(subPath) {
-                        break
-                    }
-                }
-            }
-        } else {
-            if let subs = try? self.contentsOfDirectory(atPath: path) {
-                for sub in subs {
-                    let subPath = URL(fileURLWithPath: path).appendingPathComponent(sub).relativePath
-                    if !handler(subPath) {
-                        break
-                    }
-                }
+        guard let enumerator = self.enumerator(at: URL(fileURLWithPath: path),
+                                               includingPropertiesForKeys: [],
+                                               options: [.skipsSubdirectoryDescendants, .producesRelativePathURLs]) else {
+            return
+        }
+        for case let fileURL as URL in enumerator {
+            let subPath = URL(fileURLWithPath: path).appendingPathComponent(fileURL.relativePath).relativePath
+            if !handler(subPath) {
+                break
             }
         }
     }
@@ -227,10 +213,9 @@ public struct Logger {
 }
 
 // MARK: - Error
-public struct Panic: Error, CustomDebugStringConvertible, LocalizedError {
+public struct Panic: Error, LocalizedError {
     public let message: String
-    public var localizedDescription: String { message }
-    public var debugDescription: String { message }
+    // LocalizedError derives localizedDescription from errorDescription.
     public var errorDescription: String? { message }
     public init(_ message: String) {
         self.message = message
@@ -328,7 +313,7 @@ extension Trash {
             }
             switch (config.interactiveMode, isDir) {
             case (.always, true):
-                removeDirectory(path, rootURL: url)
+                return removeDirectory(path, rootURL: url)
             case (.always, false):
                 if question.ask("remove file \(path)?") {
                     try fileManager.trashItem(at: url)
@@ -346,36 +331,41 @@ extension Trash {
         return false
     }
 
-    private func removeDirectory(_ path: String, rootURL: URL) {
+    // Returns false if the directory or any item beneath it could not be removed.
+    // A user declining a prompt is a normal cancellation, not a failure.
+    private func removeDirectory(_ path: String, rootURL: URL) -> Bool {
         let url = URL(fileURLWithPath: path)
         // when directory is empty, no examine needed
         if fileManager.isEmptyDirectory(url) {
-            removeEmptyDirectory(path)
-            return
+            return removeEmptyDirectory(path)
         }
         guard question.ask("descend into directory: '\(path)'?") else {
-            return
+            return true
         }
 
-        // remove all files or directories in the directory
+        // Remove every file or directory in the directory. A failure on one child
+        // must not abort the walk: keep enumerating siblings and report the
+        // aggregate result, matching rm which continues past errors.
+        var success = true
         fileManager.subpaths(atPath: path, enumerator: { subPath in
             // Children are compared against the cmd-line root for --one-file-system.
-            self.removeOne(path: subPath, base: rootURL)
+            success = self.removeOne(path: subPath, base: rootURL) && success
+            return true
         })
 
         // try to remove the directory after all files in it are removed
-        removeEmptyDirectory(path)
+        return removeEmptyDirectory(path) && success
     }
 
-    private func removeEmptyDirectory(_ path: String) {
+    private func removeEmptyDirectory(_ path: String) -> Bool {
         guard question.ask("remove directory '\(path)'?") else {
-            return
+            return true
         }
         var conf = config
         conf.recursive = false          // no recursive anymore
         conf.emptyDirs = true           // but can remove empty directories
         conf.interactiveMode = .never   // and no interactive mode, because did interactive before
-        Trash(config: conf, question: question, fileManager: fileManager).removeOne(path: path, base: nil)
+        return Trash(config: conf, question: question, fileManager: fileManager).removeOne(path: path, base: nil)
     }
 }
 
@@ -406,13 +396,35 @@ extension Trash {
         }
     }
 
+    // Recursively scans `root`'s subtree, returning true as soon as any descendant
+    // is on a different volume than `root`. Symbolic links are not followed (they
+    // report as .typeSymbolicLink, so we never descend through them), which also
+    // avoids cycles. A resource-value lookup that fails is treated as "same volume"
+    // so an unreadable attribute can't block an otherwise valid removal.
+    private func hasCrossMountDescendant(root: URL) -> Bool {
+        var crossed = false
+        func walk(_ dir: URL) {
+            fileManager.subpaths(atPath: dir.path) { subPath in
+                let subURL = URL(fileURLWithPath: subPath)
+                if (try? fileManager.isCrossMountPoint(subURL, against: root)) == true {
+                    crossed = true
+                    return false
+                }
+                if fileManager.fileType(subURL) == .typeDirectory {
+                    walk(subURL)
+                }
+                return !crossed
+            }
+        }
+        walk(root)
+        return crossed
+    }
+
     private func permissionCheck(path: String, base: URL?) throws -> PermissionCheckResult {
         // Protected paths check: refuse to remove '.' and '..' by basename,
-        // matching GNU/BSD rm. This also covers trailing-slash variants like
-        // "foo/./", "foo/../" because we strip a trailing slash before taking
-        // the last path component.
-        let trimmed = path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
-        let basename = (trimmed as NSString).lastPathComponent
+        // matching GNU/BSD rm. lastPathComponent already normalizes trailing
+        // slashes, so this also covers "foo/./", "foo/../", "/.", "/..", etc.
+        let basename = (path as NSString).lastPathComponent
         if basename == "." || basename == ".." {
             throw canNotRemovePanic(path: path, err: "Refusing to remove '.' or '..' directory")
         }
@@ -444,6 +456,15 @@ extension Trash {
             // root directory check
             if fileManager.isRootDir(url) && config.preserveRoot {
                 throw canNotRemovePanic(path: path, err: "Preserve root")
+            }
+
+            // one-file-system check: a command-line directory argument (base == nil)
+            // is refused as a whole if any descendant lives on a different volume,
+            // so a mount point nested inside it is never swept into the Trash. This
+            // is what makes -x effective on the non-interactive "move the whole
+            // directory at once" path, not just the interactive per-child walk.
+            if config.oneFileSystem, base == nil, hasCrossMountDescendant(root: url) {
+                throw canNotRemovePanic(path: path, err: "Cross-device link")
             }
 
             // recursive check

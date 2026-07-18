@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "rmtrash",
     platforms: [
-        .macOS(.v10_10)
+        .macOS(.v10_15)
     ],
     products: [
         .executable(name: "rmtrash", targets: ["rmtrash"])
