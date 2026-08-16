@@ -10,7 +10,7 @@ let package = Package(
         .executable(name: "rmtrash", targets: ["rmtrash"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.0")
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.2")
     ],
     targets: [
         .executableTarget(
