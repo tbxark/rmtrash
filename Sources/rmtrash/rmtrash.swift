@@ -107,7 +107,7 @@ struct Command: ParsableCommand {
 
 // MARK: - FileManager
 
-public protocol FileManagerType {
+protocol FileManagerType {
     func trashItem(at url: URL) throws
 
     func isRootDir(_ url: URL) -> Bool
@@ -125,18 +125,18 @@ public protocol FileManagerType {
 
 extension FileManager: FileManagerType {
 
-    public func trashItem(at url: URL) throws {
+    func trashItem(at url: URL) throws {
         try trashItem(at: url, resultingItemURL: nil)
         // Report only after the move succeeded, in the form the user typed the
         // path (relativePath keeps relative operands relative, like rm -v).
         Logger.verbose("moved '\(url.relativePath)' to trash")
     }
 
-    public func isRootDir(_ url: URL) -> Bool {
+    func isRootDir(_ url: URL) -> Bool {
         return url.standardizedFileURL.path == "/"
     }
 
-    public func isEmptyDirectory(_ url: URL) -> Bool {
+    func isEmptyDirectory(_ url: URL) -> Bool {
         // If the directory cannot be read (e.g. permission denied), conservatively
         // treat it as non-empty so the caller refuses to remove it instead of
         // silently proceeding. Note: `enumerator(at:)` never returns nil and
@@ -147,7 +147,7 @@ extension FileManager: FileManagerType {
         return contents.isEmpty
     }
 
-    public func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool {
+    func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool {
         let baseVol = try base.resourceValues(forKeys: [.volumeURLKey, .volumeUUIDStringKey, .volumeIdentifierKey])
         let urlVol = try url.resourceValues(forKeys: [.volumeURLKey, .volumeUUIDStringKey, .volumeIdentifierKey])
 
@@ -174,7 +174,7 @@ extension FileManager: FileManagerType {
         return true
     }
 
-    public func fileType(_ url: URL) throws -> FileAttributeType? {
+    func fileType(_ url: URL) throws -> FileAttributeType? {
         do {
             let attr = try self.attributesOfItem(atPath: url.path)
             return attr[.type] as? FileAttributeType
@@ -183,7 +183,7 @@ extension FileManager: FileManagerType {
         }
     }
 
-    public func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
+    func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
         guard let enumerator = self.enumerator(at: URL(fileURLWithPath: path),
                                                includingPropertiesForKeys: [],
                                                options: [.skipsSubdirectoryDescendants, .producesRelativePathURLs]) else {
@@ -200,26 +200,28 @@ extension FileManager: FileManagerType {
 }
 
 // MARK: - Logger
-public struct Logger {
-    public enum Level: Int {
+struct Logger {
+    enum Level: Int {
         case verbose = 0
         case error = 1
     }
 
-    public static var level: Level = .error
+    // Process-wide, set once from the parsed arguments before any work starts.
+    // rmtrash is single-threaded, so no synchronisation is needed.
+    static var level: Level = .error
 
-    public struct StdError: TextOutputStream {
-        public mutating func write(_ string: String) {
+    struct StdError: TextOutputStream {
+        mutating func write(_ string: String) {
             fputs(string, stderr)
         }
     }
 
-    public static func verbose(_ message: String) {
+    static func verbose(_ message: String) {
         guard level.rawValue <= Level.verbose.rawValue else { return }
         print(message)
     }
 
-    public static func error(_ message: String) {
+    static func error(_ message: String) {
         guard level.rawValue <= Level.error.rawValue else { return }
         var stdError = StdError()
         print(message, to: &stdError)
@@ -261,24 +263,24 @@ extension Error {
     }
 }
 
-public struct Panic: Error, LocalizedError {
-    public let message: String
+struct Panic: Error, LocalizedError {
+    let message: String
     // LocalizedError derives localizedDescription from errorDescription.
-    public var errorDescription: String? { message }
-    public init(_ message: String) {
+    var errorDescription: String? { message }
+    init(_ message: String) {
         self.message = message
     }
 }
 
 // MARK: - Question
-public protocol Question {
+protocol Question {
     func ask(_ message: String) -> Bool
 }
 
-public struct CommandLineQuestion: Question {
-    public init() {}
+struct CommandLineQuestion: Question {
+    init() {}
 
-    public func ask(_ message: String) -> Bool {
+    func ask(_ message: String) -> Bool {
         // Prompts go to stderr, like rm, so they are visible even when stdout is
         // redirected and never pollute stdout for scripts. Flush explicitly: the
         // prompt has no trailing newline, so buffering could otherwise hold it
@@ -294,24 +296,24 @@ public struct CommandLineQuestion: Question {
 }
 
 // MARK: - Trash
-public struct Trash {
+struct Trash {
 
-    public struct Config: Codable {
-        public enum InteractiveMode: String, ExpressibleByArgument, Codable {
+    struct Config {
+        enum InteractiveMode: String, ExpressibleByArgument {
             case always
             case once
             case never
         }
 
-        public var interactiveMode: InteractiveMode
-        public var force: Bool
-        public var recursive: Bool
-        public var emptyDirs: Bool
-        public var preserveRoot: Bool
-        public var oneFileSystem: Bool
-        public var verbose: Bool
+        var interactiveMode: InteractiveMode
+        var force: Bool
+        var recursive: Bool
+        var emptyDirs: Bool
+        var preserveRoot: Bool
+        var oneFileSystem: Bool
+        var verbose: Bool
 
-        public init(interactiveMode: InteractiveMode, force: Bool, recursive: Bool, emptyDirs: Bool, preserveRoot: Bool, oneFileSystem: Bool, verbose: Bool) {
+        init(interactiveMode: InteractiveMode, force: Bool, recursive: Bool, emptyDirs: Bool, preserveRoot: Bool, oneFileSystem: Bool, verbose: Bool) {
             self.interactiveMode = interactiveMode
             self.force = force
             self.recursive = recursive
@@ -322,11 +324,11 @@ public struct Trash {
         }
     }
 
-    public let config: Config
-    public let question: Question
-    public let fileManager: FileManagerType
+    let config: Config
+    let question: Question
+    let fileManager: FileManagerType
 
-    public init(config: Config, question: Question = CommandLineQuestion(), fileManager: FileManagerType = FileManager.default) {
+    init(config: Config, question: Question = CommandLineQuestion(), fileManager: FileManagerType = FileManager.default) {
         self.config = config
         self.question = question
         self.fileManager = fileManager
@@ -341,7 +343,7 @@ public struct Trash {
 // MARK: Remove handling
 extension Trash {
 
-    public func removeMultiple(paths: [String]) -> Bool {
+    func removeMultiple(paths: [String]) -> Bool {
         guard paths.count > 0 else {
             return true
         }
@@ -367,7 +369,7 @@ extension Trash {
             }
             switch (config.interactiveMode, isDir) {
             case (.always, true):
-                return removeDirectory(path, rootURL: url)
+                return removeDirectory(path, url: url)
             case (.always, false):
                 if question.ask("remove file \(path)?") {
                     try fileManager.trashItem(at: url)
@@ -387,8 +389,10 @@ extension Trash {
 
     // Returns false if the directory or any item beneath it could not be removed.
     // A user declining a prompt is a normal cancellation, not a failure.
-    private func removeDirectory(_ path: String, rootURL: URL) -> Bool {
-        let url = URL(fileURLWithPath: path)
+    // `url` is the directory being removed; children are checked against it for
+    // --one-file-system. Same-volume is transitive, so comparing each level to
+    // its parent is equivalent to comparing to the command-line argument.
+    private func removeDirectory(_ path: String, url: URL) -> Bool {
         // when directory is empty, no examine needed
         if fileManager.isEmptyDirectory(url) {
             return removeEmptyDirectory(path)
@@ -402,8 +406,7 @@ extension Trash {
         // aggregate result, matching rm which continues past errors.
         var success = true
         fileManager.subpaths(atPath: path, enumerator: { subPath in
-            // Children are compared against the cmd-line root for --one-file-system.
-            success = self.removeOne(path: subPath, base: rootURL) && success
+            success = self.removeOne(path: subPath, base: url) && success
             return true
         })
 
