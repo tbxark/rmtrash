@@ -49,7 +49,6 @@ struct Command: ParsableCommand {
         do {
             let args = try parseArgs()
             Logger.level = args.verbose ? .verbose : .error
-            Logger.verbose("Arguments: \(args)")
             if !Trash(config: args).removeMultiple(paths: paths) {
                 Command.exit(withError: ExitCode.failure)
             }
@@ -118,8 +117,10 @@ public protocol FileManagerType {
 extension FileManager: FileManagerType {
 
     public func trashItem(at url: URL) throws {
-        Logger.verbose("rmtrash: \(url.path)")
         try trashItem(at: url, resultingItemURL: nil)
+        // Report only after the move succeeded, in the form the user typed the
+        // path (relativePath keeps relative operands relative, like rm -v).
+        Logger.verbose("moved '\(url.relativePath)' to trash")
     }
 
     public func isRootDir(_ url: URL) -> Bool {
