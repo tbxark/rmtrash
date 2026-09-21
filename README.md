@@ -63,6 +63,10 @@ rmtrash --version
 
 If the **-I**/**--interactive=once** option is given, and there are more than three files or the **-r**/**-R**/**--recursive** options are specified, **rm** prompts before deleting anything. If the user does not respond **yes**/**y**/**Y** to the prompt, the entire command is aborted.
 
+### Preserving the root directory
+
+**--preserve-root** (the default) protects only `/` itself (including spellings such as `//` or `/./`). A symbolic link that points to `/` is removed as a link; its target is never followed. Other important locations such as your home directory, `/System/Volumes/Data`, or mounted volumes are not protected, matching **rm**. GNU's **--preserve-root=all** is not supported.
+
 ### Removing directories
 
 By default, rm does not remove directories. If the -r/-R/--recursive option is specified, however, rm removes any matching directories and their contents.

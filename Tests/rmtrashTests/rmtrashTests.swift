@@ -1088,6 +1088,28 @@ final class RmTrashTests: CWDRestoringTestCase {
         XCTAssertNil(try mock.fileType(dir))
     }
 
+    /// A symlink pointing at the root directory is just a link: `-r` removes
+    /// the link and never reaches the root, with or without a trailing slash.
+    /// Uses a mock root so the real `/` is never involved.
+    func testSymlinkToRootRemovesOnlyTheLink() throws {
+        let (real, url) = FileManager.createTempDirectory()
+        defer { try? real.removeItem(at: url) }
+        let rootlike = url.appendingPathComponent("rootlike")
+        try real.createDirectory(at: rootlike, withIntermediateDirectories: true)
+        real.createFile(atPath: rootlike.appendingPathComponent("etc").path, contents: nil, attributes: nil)
+        let link = url.appendingPathComponent("rootlink")
+        try real.createSymbolicLink(at: link, withDestinationURL: rootlike)
+
+        let mock = RecordingFileManager()
+        mock.roots = [rootlike.standardizedFileURL.path]
+        let trash = makeTrash(recursive: true, preserveRoot: true, fileManager: mock)
+
+        XCTAssertTrue(trash.removeMultiple(paths: [link.path + "/"]))
+        XCTAssertEqual(mock.removed, ["rootlink"])
+        XCTAssertNil(try mock.fileType(link))
+        XCTAssertEqual(try mock.fileType(rootlike.appendingPathComponent("etc")), .typeRegular)
+    }
+
     // MARK: - Protected Operands Tests
 
     func testProtectedOperands() {
