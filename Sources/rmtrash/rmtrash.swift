@@ -124,12 +124,14 @@ extension FileManager: FileManagerType {
     }
 
     public func isEmptyDirectory(_ url: URL) -> Bool {
-        // If we cannot enumerate (e.g. permission denied), conservatively treat as non-empty
-        // so the caller refuses to remove it instead of silently proceeding.
-        guard let enumerator = enumerator(at: url, includingPropertiesForKeys: nil, options: []) else {
+        // If the directory cannot be read (e.g. permission denied), conservatively
+        // treat it as non-empty so the caller refuses to remove it instead of
+        // silently proceeding. Note: `enumerator(at:)` never returns nil and
+        // swallows read errors, which is why `contentsOfDirectory` is used here.
+        guard let contents = try? contentsOfDirectory(atPath: url.path) else {
             return false
         }
-        return enumerator.nextObject() == nil
+        return contents.isEmpty
     }
 
     public func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool {

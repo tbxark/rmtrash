@@ -467,6 +467,24 @@ final class RmTrashTests: XCTestCase {
         XCTAssertFalse(trash.removeMultiple(paths: ["./nonEmptyDir"]))
     }
 
+    /// `-d` must refuse a directory it cannot read, even though it cannot prove
+    /// the directory is non-empty (RF-001 regression).
+    func testEmptyDirsRefusesUnreadableDirectory() throws {
+        try XCTSkipIf(getuid() == 0, "root bypasses permission bits")
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+
+        let locked = url.appendingPathComponent("locked")
+        try fileManager.createDirectory(at: locked, withIntermediateDirectories: true)
+        fileManager.createFile(atPath: locked.appendingPathComponent("secret.txt").path, contents: nil, attributes: nil)
+        chmod(locked.path, 0)
+        defer { chmod(locked.path, 0o755) }
+
+        let trash = makeTrash(emptyDirs: true, fileManager: fileManager)
+        XCTAssertFalse(trash.removeMultiple(paths: [locked.path]))
+        XCTAssertEqual(fileManager.fileType(locked), .typeDirectory)
+    }
+
     func testInteractiveModeOnce() {
 
         let (fileManager, url) = FileManager.createTempDirectory()
@@ -1201,6 +1219,22 @@ final class FileManagerTests: XCTestCase {
         let fileURL = url.appendingPathComponent("test.txt")
         fileManager.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
         XCTAssertFalse(fileManager.isEmptyDirectory(url))
+    }
+
+    /// An unreadable directory must be reported as non-empty: the `-d` guard
+    /// relies on this to refuse trashing a directory whose contents it cannot see.
+    func testUnreadableDirectoryIsNotEmpty() throws {
+        try XCTSkipIf(getuid() == 0, "root bypasses permission bits")
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+
+        let locked = url.appendingPathComponent("locked")
+        try fileManager.createDirectory(at: locked, withIntermediateDirectories: true)
+        fileManager.createFile(atPath: locked.appendingPathComponent("secret.txt").path, contents: nil, attributes: nil)
+        chmod(locked.path, 0)
+        defer { chmod(locked.path, 0o755) }
+
+        XCTAssertFalse(fileManager.isEmptyDirectory(locked))
     }
 
     func testFileTypeDetection() {
