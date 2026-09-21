@@ -1,5 +1,7 @@
 bin = rmtrash
-install_dir = /opt/homebrew/bin
+# Homebrew prefix differs between Apple Silicon (/opt/homebrew) and Intel
+# (/usr/local); override with `make install install_dir=/some/bin`.
+install_dir ?= $(shell brew --prefix 2>/dev/null || echo /usr/local)/bin
 version = $(shell git describe --tags --abbrev=0)
 
 .PHONY: deps
@@ -36,8 +38,18 @@ build-universal:
 	swift build --configuration release --arch arm64
 	lipo -create .build/x86_64-apple-macosx/release/$(bin) .build/arm64-apple-macosx/release/$(bin) -output .build/release/$(bin)
 
+# The version string is hard-coded in Sources/rmtrash/rmtrash.swift while the
+# release archives are named after the git tag; refuse to release if they drift.
+.PHONY: check-version
+check-version: build
+	@bin_version="$$(.build/release/$(bin) --version)"; \
+	if [ "$$bin_version" != "$(version)" ]; then \
+		echo "version mismatch: binary reports '$$bin_version' but git tag is '$(version)'"; \
+		exit 1; \
+	fi
+
 .PHONY: release
-release: test build-universal manual
+release: test check-version build-universal manual
 	mkdir -p .dist
 	# x86_64
 	cp Manual/$(bin).1 .build/x86_64-apple-macosx/release
