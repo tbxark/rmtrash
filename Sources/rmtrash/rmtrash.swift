@@ -10,12 +10,10 @@ struct Command: ParsableCommand {
         discussion: "rmtrash is a small utility that will move the file to macOS's Trash rather than obliterating the file (as rm does).",
         version: "0.8.0",
         shouldDisplay: true,
-        subcommands: [],
-        helpNames: .long,
-        aliases: ["trash", "del", "rm"]
+        helpNames: .long
     )
 
-    @Flag(name: .shortAndLong, help: "Ignore nonexistant files, and never prompt before removing.")
+    @Flag(name: .shortAndLong, help: "Ignore nonexistent files, and never prompt before removing.")
     var force: Bool = false
 
     @Flag(name: .customShort("i"), help: "Prompt before every removal.")

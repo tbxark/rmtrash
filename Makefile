@@ -23,7 +23,10 @@ build:
 .PHONY: manual
 manual:
 	swift package generate-manual
-	cp .build/plugins/GenerateManual/outputs/$(bin)/$(bin).1 Manual/$(bin).1
+	# The plugin documents an implicit 'help' subcommand that rmtrash does not
+	# actually have (it is a single command); strip that section.
+	sed -e '/^\.Ar subcommand$$/d' -e '/^\.It Em help$$/,/^\.El$$/d' \
+		.build/plugins/GenerateManual/outputs/$(bin)/$(bin).1 > Manual/$(bin).1
 	# install config in brew formula
 	# man1.install "Manual/rmtrash.1"
 
@@ -37,13 +40,13 @@ build-universal:
 release: test build-universal manual
 	mkdir -p .dist
 	# x86_64
-	cp .build/plugins/GenerateManual/outputs/$(bin)/$(bin).1 .build/x86_64-apple-macosx/release
+	cp Manual/$(bin).1 .build/x86_64-apple-macosx/release
 	tar -czf .dist/$(bin)_$(version)_x86_64.tar.gz -C .build/x86_64-apple-macosx/release $(bin) $(bin).1
 	# arm64
-	cp .build/plugins/GenerateManual/outputs/$(bin)/$(bin).1 .build/arm64-apple-macosx/release
+	cp Manual/$(bin).1 .build/arm64-apple-macosx/release
 	tar -czf .dist/$(bin)_$(version)_arm64.tar.gz -C .build/arm64-apple-macosx/release $(bin) $(bin).1
 	# universal
-	cp .build/plugins/GenerateManual/outputs/$(bin)/$(bin).1 .build/release
+	cp Manual/$(bin).1 .build/release
 	tar -czf .dist/$(bin)_$(version)_universal.tar.gz -C .build/release $(bin) $(bin).1
 
 .PHONY: install

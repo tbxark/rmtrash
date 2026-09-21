@@ -1430,6 +1430,14 @@ final class CommandParsingTests: XCTestCase {
         XCTAssertThrowsError(try Command.parse(["--interactive=nope", "x"]))
     }
 
+    /// `--interactive` requires WHEN (documented in README, man page, and help).
+    /// A bare `--interactive` followed by an operand is a parse error rather
+    /// than silently consuming the operand as a mode.
+    func testInteractiveRequiresValue() {
+        XCTAssertThrowsError(try Command.parse(["--interactive"]))
+        XCTAssertThrowsError(try Command.parse(["--interactive", "file.txt"]))
+    }
+
     func testBooleanFlagsMapToConfig() throws {
         let c = try config(["-r", "-d", "-x", "x"])
         XCTAssertTrue(c.recursive)

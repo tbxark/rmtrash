@@ -32,7 +32,7 @@ mint install tbxark/rmtrash
 ### Syntax
 
 ```
-rmtrash [-f | --force] {[-i | --interactive[=always]] | [-I | --interactive=once] |
+rmtrash [-f | --force] {[-i | --interactive=always] | [-I | --interactive=once] |
    [--interactive=never]} [--one-file-system | -x] [--no-preserve-root |
    --preserve-root] [-r | -R | --recursive] [-d | --dir] [-v | --verbose] 
    FILE...
@@ -46,10 +46,10 @@ rmtrash --version
 
 | Options                         | Description                                                  |
 | :------------------------------ | :----------------------------------------------------------- |
-| **-f**, **--force**             | Ignore nonexistant files, and never prompt before removing.  |
+| **-f**, **--force**             | Ignore nonexistent files, and never prompt before removing.  |
 | **-i**                          | Prompt before every removal.                                 |
 | **-I**                          | Prompt once before removing more than three files, or when removing recursively. This option is less intrusive than **-i**, but still gives protection against most mistakes. |
-| **--interactive**[**=***WHEN*]  | Prompt according to *WHEN*: **never**, **once** (**-I**), or **always** (**-i**). If *WHEN* is not specified, then never prompt. |
+| **--interactive=***WHEN*         | Prompt according to *WHEN*: **never**, **once** (**-I**), or **always** (**-i**). *WHEN* is required; use **-i** for the equivalent of **--interactive=always**. |
 | **--one-file-system**, **-x**   | When removing a hierarchy recursively, refuse to remove a command line argument if any directory beneath it is on a different file system. Unlike **rm**, nothing is removed in that case: a directory is moved to the Trash as a whole, so the foreign file system cannot be skipped. The error names the offending path. |
 | **--no-preserve-root**          | Do not treat "**/**" (the root directory) in any special way. |
 | **--preserve-root**             | Do not remove "**/**" (the root directory), which is the default behavior. |
