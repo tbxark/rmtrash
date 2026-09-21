@@ -1175,6 +1175,34 @@ final class RmTrashTests: CWDRestoringTestCase {
         XCTAssertEqual(try mockFM.fileType(URL(fileURLWithPath: rootPath)), .typeDirectory)
     }
 
+    /// The whole-argument refusal applies in interactive mode too: the user is
+    /// never even asked to descend into a directory that spans a mount point.
+    func testOneFileSystemRefusesSpanningDirectoryBeforePromptingInteractively() throws {
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+
+        fileManager.createFileStructure(nodes: [
+            .directory(name: "root", sub: [
+                .file(name: "same_vol.txt", content: "a"),
+                .directory(name: "mnt", sub: [.file(name: "cross_vol.txt", content: "b")])
+            ])
+        ], at: url)
+
+        let rootPath = url.appendingPathComponent("root").path
+        let mockFM = FileSystemTestUtilities.VolumeSimulator.MockVolumeFileManager()
+        mockFM.setVolume("volRoot", for: rootPath)
+        mockFM.setVolume("volOther", for: url.appendingPathComponent("root/mnt").path)
+
+        let q = RecordingQuestion(answer: true)
+        let trash = makeTrash(interactiveMode: .always, force: false, recursive: true,
+                              oneFileSystem: true, fileManager: mockFM, question: q)
+
+        XCTAssertFalse(trash.removeMultiple(paths: [rootPath]))
+        XCTAssertTrue(q.asked.isEmpty)
+        XCTAssertEqual(try mockFM.fileType(URL(fileURLWithPath: rootPath + "/same_vol.txt")), .typeRegular)
+        XCTAssertEqual(try mockFM.fileType(URL(fileURLWithPath: rootPath + "/mnt/cross_vol.txt")), .typeRegular)
+    }
+
     func testOneFileSystemAllowsSingleVolumeDirectory() throws {
         // --one-file-system must not block a directory that lives entirely on one
         // volume; the whole tree is removed normally.

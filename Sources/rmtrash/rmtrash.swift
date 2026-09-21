@@ -27,7 +27,7 @@ struct Command: ParsableCommand {
     @Option(name: .customLong("interactive"), help: "Prompt according to WHEN: never, once (-I), or always (-i). WHEN is required; use -i if you want the equivalent of '--interactive=always'.")
     var interactive: Trash.Config.InteractiveMode?
 
-    @Flag(name: [.customLong("one-file-system"), .customShort("x")], help: "When removing a hierarchy recursively, skip any directory that is on a file system different from that of the corresponding command line argument ")
+    @Flag(name: [.customLong("one-file-system"), .customShort("x")], help: "When removing a hierarchy recursively, refuse to remove a command line argument if any directory beneath it is on a different file system. Unlike rm, nothing is removed in that case: a directory is moved to the Trash as a whole, so the foreign file system cannot be skipped.")
     var oneFileSystem: Bool = false
 
     @Flag(name: .customLong("preserve-root"), inversion: .prefixedNo, help: "Do not remove \"/\" (the root directory), which is the default behavior.")
@@ -436,24 +436,25 @@ extension Trash {
         }
     }
 
-    // Recursively scans `root`'s subtree, returning true as soon as any descendant
-    // is on a different volume than `root`. Symbolic links are not followed (they
-    // report as .typeSymbolicLink, so we never descend through them), which also
-    // avoids cycles. A resource-value lookup that fails is treated as "same volume"
-    // so an unreadable attribute can't block an otherwise valid removal.
-    private func hasCrossMountDescendant(root: URL) -> Bool {
-        var crossed = false
+    // Recursively scans `root`'s subtree, returning the path of the first
+    // descendant that is on a different volume than `root`, or nil if the whole
+    // tree is on one volume. Symbolic links are not followed (they report as
+    // .typeSymbolicLink, so we never descend through them), which also avoids
+    // cycles. A resource-value lookup that fails is treated as "same volume" so
+    // an unreadable attribute can't block an otherwise valid removal.
+    private func firstCrossMountDescendant(root: URL) -> String? {
+        var crossed: String?
         func walk(_ dir: URL) {
             fileManager.subpaths(atPath: dir.path) { subPath in
                 let subURL = URL(fileURLWithPath: subPath)
                 if (try? fileManager.isCrossMountPoint(subURL, against: root)) == true {
-                    crossed = true
+                    crossed = subPath
                     return false
                 }
                 if (try? fileManager.fileType(subURL)) == .typeDirectory {
                     walk(subURL)
                 }
-                return !crossed
+                return crossed == nil
             }
         }
         walk(root)
@@ -489,9 +490,12 @@ extension Trash {
 
         let isDir = fileType == .typeDirectory
 
-        // cross mount point check: only applies to descendants of a command-line
-        // argument. The command-line argument itself (base == nil) is the reference
-        // point, so it can never be "cross-mount" relative to itself.
+        // cross mount point check for items reached while walking a directory
+        // interactively (base is the enclosing directory). The command-line
+        // argument itself (base == nil) is the reference point, so it can never
+        // be "cross-mount" relative to itself. In practice a command-line tree
+        // containing a foreign volume is already refused as a whole below, so
+        // this is defence in depth for mounts that appear mid-walk.
         if config.oneFileSystem, let base = base {
             let cross = try fileManager.isCrossMountPoint(url, against: base)
             if cross {
@@ -508,11 +512,13 @@ extension Trash {
 
             // one-file-system check: a command-line directory argument (base == nil)
             // is refused as a whole if any descendant lives on a different volume,
-            // so a mount point nested inside it is never swept into the Trash. This
-            // is what makes -x effective on the non-interactive "move the whole
-            // directory at once" path, not just the interactive per-child walk.
-            if config.oneFileSystem, base == nil, hasCrossMountDescendant(root: url) {
-                throw canNotRemovePanic(path: path, err: "Cross-device link")
+            // so a mount point nested inside it is never swept into the Trash.
+            // Unlike rm -x, rmtrash cannot "skip" the foreign volume and remove the
+            // rest: a directory is moved to the Trash as a single item, so the
+            // only safe answer is to refuse the whole argument and point at the
+            // offending path.
+            if config.oneFileSystem, base == nil, let foreign = firstCrossMountDescendant(root: url) {
+                throw canNotRemovePanic(path: path, err: "Cross-device link ('\(foreign)' is on a different file system)")
             }
 
             // recursive check

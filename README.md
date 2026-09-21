@@ -50,7 +50,7 @@ rmtrash --version
 | **-i**                          | Prompt before every removal.                                 |
 | **-I**                          | Prompt once before removing more than three files, or when removing recursively. This option is less intrusive than **-i**, but still gives protection against most mistakes. |
 | **--interactive**[**=***WHEN*]  | Prompt according to *WHEN*: **never**, **once** (**-I**), or **always** (**-i**). If *WHEN* is not specified, then never prompt. |
-| **--one-file-system**, **-x**   | When removing a hierarchy recursively, skip any directory that is on a file system different from that of the corresponding command line argument |
+| **--one-file-system**, **-x**   | When removing a hierarchy recursively, refuse to remove a command line argument if any directory beneath it is on a different file system. Unlike **rm**, nothing is removed in that case: a directory is moved to the Trash as a whole, so the foreign file system cannot be skipped. The error names the offending path. |
 | **--no-preserve-root**          | Do not treat "**/**" (the root directory) in any special way. |
 | **--preserve-root**             | Do not remove "**/**" (the root directory), which is the default behavior. |
 | **-r**, **-R**, **--recursive** | Remove directories and their contents recursively.           |
