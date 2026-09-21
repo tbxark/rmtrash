@@ -151,6 +151,9 @@ class CWDRestoringTestCase: XCTestCase {
 }
 
 extension FileManager {
+    /// Reads the tree back as `FileNode`s. Hard links are indistinguishable from
+    /// regular files on disk, so they come back as `.file`, never `.hardLink`;
+    /// don't put `.hardLink` in an expected structure.
     func currentFileStructure(at url: URL) -> FileNode? {
         guard let attr = try? attributesOfItem(atPath: url.path),
               let type = attr[.type] as? FileAttributeType else {
@@ -685,8 +688,8 @@ final class RmTrashTests: CWDRestoringTestCase {
 
         let trash = makeTrash(force: false, recursive: true, emptyDirs: true, fileManager: fileManager)
 
-        let file = url.appending(path: "no_such_file")
-        let link = url.appending(path: "sym.link")
+        let file = url.appendingPathComponent("no_such_file")
+        let link = url.appendingPathComponent("sym.link")
 
         XCTAssertNil(try fileManager.fileType(file))
         XCTAssertNil(try fileManager.fileType(link))
@@ -900,6 +903,76 @@ final class RmTrashTests: CWDRestoringTestCase {
 
         XCTAssertEqual(Set(mock.attempted), ["a.txt", "b.txt", "c.txt"])
         XCTAssertEqual(Set(mock.removed), ["b.txt", "c.txt"])
+    }
+
+    /// Declining "descend into directory" on a nested directory is a normal
+    /// cancellation: that subtree is left untouched, siblings are still
+    /// processed, and the parent (now non-empty) is reported as a failure only
+    /// because it cannot be removed, never because the user said no.
+    func testInteractiveDecliningDescendLeavesSubtreeUntouched() throws {
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+        fileManager.createFileStructure(nodes: [
+            .directory(name: "dir", sub: [
+                .file(name: "a.txt", content: "a"),
+                .directory(name: "keep", sub: [.file(name: "inner.txt", content: "i")])
+            ])
+        ], at: url)
+
+        /// Says yes to everything except descending into "keep".
+        final class SelectiveQuestion: Question {
+            private(set) var asked: [String] = []
+            func ask(_ message: String) -> Bool {
+                asked.append(message)
+                return !message.contains("descend into directory: '") || !message.contains("/keep'")
+            }
+        }
+        let q = SelectiveQuestion()
+        let mock = RecordingFileManager()
+        let trash = makeTrash(interactiveMode: .always, force: false, recursive: true, fileManager: mock, question: q)
+
+        let dirPath = url.appendingPathComponent("dir").path
+        XCTAssertFalse(trash.removeMultiple(paths: [dirPath]), "parent cannot be removed while 'keep' remains")
+        XCTAssertEqual(mock.removed, ["a.txt"])
+        XCTAssertEqual(try mock.fileType(url.appendingPathComponent("dir/keep/inner.txt")), .typeRegular)
+        XCTAssertFalse(q.asked.contains { $0.contains("inner.txt") }, "never prompted for contents of the declined subtree")
+    }
+
+    // MARK: - Symbolic Links to Directories
+
+    /// A trailing slash on a symlink to a directory (what shell tab-completion
+    /// produces) must not cause the link target to be trashed. BSD `rm -r link/`
+    /// removes the target's contents; rmtrash removes only the link.
+    func testTrailingSlashOnSymlinkToDirectoryRemovesOnlyTheLink() throws {
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+        fileManager.createFileStructure(nodes: [
+            .directory(name: "realdir", sub: [.file(name: "keep.txt", content: "k")]),
+            .symbolicLink(name: "link", target: "realdir")
+        ], at: url)
+
+        let trash = makeTrash(force: false, recursive: true, fileManager: fileManager)
+        XCTAssertTrue(trash.removeMultiple(paths: [url.appendingPathComponent("link").path + "/"]))
+
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("link")))
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("realdir/keep.txt")), .typeRegular)
+    }
+
+    /// `-d` on a symlink to a (non-empty) directory removes the link, like
+    /// `rm -d link`; the directory check never applies to the link itself.
+    func testEmptyDirsOnSymlinkToDirectoryRemovesOnlyTheLink() throws {
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+        fileManager.createFileStructure(nodes: [
+            .directory(name: "realdir", sub: [.file(name: "keep.txt", content: "k")]),
+            .symbolicLink(name: "link", target: "realdir")
+        ], at: url)
+
+        let trash = makeTrash(force: false, emptyDirs: true, fileManager: fileManager)
+        XCTAssertTrue(trash.removeMultiple(paths: [url.appendingPathComponent("link").path]))
+
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("link")))
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("realdir/keep.txt")), .typeRegular)
     }
 
     // MARK: - Interactive Once Threshold
