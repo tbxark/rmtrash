@@ -82,7 +82,7 @@ final class RecordingQuestion: Question {
 /// and can be told to fail for specific basenames to exercise error-handling
 /// paths. Enumeration is sorted so tests can reason about child ordering.
 final class RecordingFileManager: FileManagerType {
-    private let real = FileManager()
+    private let real = TestFileManager()
 
     /// Basenames for which `trashItem` throws instead of removing.
     var failing: Set<String> = []
@@ -116,6 +116,37 @@ final class RecordingFileManager: FileManagerType {
             let child = URL(fileURLWithPath: path).appendingPathComponent(name).path
             if !handler(child) { break }
         }
+    }
+}
+
+/// A `FileManager` whose `trashItem` deletes the item outright instead of moving
+/// it to `~/.Trash`. Every other method (stat, enumeration, emptiness, volume
+/// lookup) is the real implementation, so tests exercise the production code
+/// paths without leaving anything in the user's Trash.
+final class TestFileManager: FileManager {
+    /// URLs that were "trashed" (deleted), in call order.
+    private(set) var trashed: [URL] = []
+
+    override func trashItem(at url: URL, resultingItemURL outResultingURL: AutoreleasingUnsafeMutablePointer<NSURL?>?) throws {
+        try removeItem(at: url)
+        trashed.append(url)
+        outResultingURL?.pointee = nil
+    }
+}
+
+/// Restores the process working directory after each test, since
+/// `createTempDirectory` changes it and the tests share one process.
+class CWDRestoringTestCase: XCTestCase {
+    private var originalCWD = ""
+
+    override func setUp() {
+        super.setUp()
+        originalCWD = FileManager.default.currentDirectoryPath
+    }
+
+    override func tearDown() {
+        FileManager.default.changeCurrentDirectoryPath(originalCWD)
+        super.tearDown()
     }
 }
 
@@ -178,8 +209,10 @@ extension FileManager {
         }
     }
 
+    /// Creates a fresh temp directory, makes it the CWD, and returns a
+    /// `TestFileManager` (deletes instead of trashing) rooted there.
     static func createTempDirectory() -> (fileManager: FileManager, url: URL) {
-        let fileManager = FileManager()
+        let fileManager = TestFileManager()
         let tempDir = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try? fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true, attributes: nil)
         fileManager.changeCurrentDirectoryPath(tempDir.path)
@@ -267,7 +300,7 @@ struct FileSystemTestUtilities {
         /// of the supplied `base`, exercising the rm semantics of "compare against the
         /// command-line argument".
         class MockVolumeFileManager: FileManagerType {
-            private let baseFileManager = FileManager()
+            private let baseFileManager = TestFileManager()
             private var volumeMap: [String: String] = [:]
 
             func setVolume(_ volumeId: String, for path: String) {
@@ -392,7 +425,22 @@ struct FileSystemTestUtilities {
     }
 }
 
-final class RmTrashTests: XCTestCase {
+final class RmTrashTests: CWDRestoringTestCase {
+
+    /// Guards the test infrastructure itself: the file manager handed out by
+    /// `createTempDirectory` must never call the real `trashItem`.
+    func testTempDirectoryFileManagerDeletesInsteadOfTrashing() throws {
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+        let testFM = try XCTUnwrap(fileManager as? TestFileManager)
+
+        let file = url.appendingPathComponent("gone.txt")
+        fileManager.createFile(atPath: file.path, contents: nil, attributes: nil)
+        XCTAssertTrue(makeTrash(fileManager: fileManager).removeMultiple(paths: [file.path]))
+
+        XCTAssertEqual(testFM.trashed.map { $0.standardizedFileURL.path }, [file.standardizedFileURL.path])
+        XCTAssertNil(try fileManager.fileType(file))
+    }
 
     func testForceConfig() {
 
@@ -1216,7 +1264,7 @@ final class RmTrashTests: XCTestCase {
     }
 }
 
-final class FileManagerTests: XCTestCase {
+final class FileManagerTests: CWDRestoringTestCase {
 
     func testIsRootDir() throws {
 
@@ -1372,7 +1420,7 @@ func makeTrash(
     preserveRoot: Bool = true,
     oneFileSystem: Bool = false,
     verbose: Bool = false,
-    fileManager: FileManagerType = FileManager.default,
+    fileManager: FileManagerType = TestFileManager(),
     question: Question =  StaticAnswer(value: true)
 ) -> Trash {
     let config = Trash.Config(
