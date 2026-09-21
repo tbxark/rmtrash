@@ -944,6 +944,55 @@ final class RmTrashTests: CWDRestoringTestCase {
         XCTAssertTrue(mock.removed.isEmpty)
     }
 
+    /// Without -r, directories count like any other operand: three or fewer
+    /// operands never prompt (GNU rm -I).
+    func testInteractiveOnceDoesNotPromptForFewDirectoriesWithoutRecursive() {
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+        fileManager.createFileStructure(nodes: [
+            .directory(name: "d1", sub: []),
+            .directory(name: "d2", sub: [])
+        ], at: url)
+
+        let q = RecordingQuestion(answer: false)
+        let trash = makeTrash(interactiveMode: .once, force: false, emptyDirs: true, fileManager: fileManager, question: q)
+
+        XCTAssertTrue(trash.removeMultiple(paths: [url.appendingPathComponent("d1").path, url.appendingPathComponent("d2").path]))
+        XCTAssertTrue(q.asked.isEmpty)
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("d1")))
+    }
+
+    /// With -r, even a single operand prompts, and the wording says so.
+    func testInteractiveOncePromptsForAnyOperandWhenRecursive() {
+        let (mock, paths, cleanup) = makeFilesScenario(["a.txt"])
+        defer { cleanup() }
+
+        let q = RecordingQuestion(answer: false)
+        let trash = makeTrash(interactiveMode: .once, force: false, recursive: true, fileManager: mock, question: q)
+
+        XCTAssertTrue(trash.removeMultiple(paths: paths))
+        XCTAssertEqual(q.asked, ["recursively remove 1 file?"])
+        XCTAssertTrue(mock.removed.isEmpty)
+    }
+
+    /// More than three operands without -r prompts with plain "remove" wording
+    /// and counts directories and files separately.
+    func testInteractiveOnceWordingWithoutRecursive() {
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+        fileManager.createFileStructure(nodes: [
+            .directory(name: "d1", sub: []),
+            .file(name: "a.txt"), .file(name: "b.txt"), .file(name: "c.txt")
+        ], at: url)
+
+        let q = RecordingQuestion(answer: false)
+        let trash = makeTrash(interactiveMode: .once, force: false, emptyDirs: true, fileManager: fileManager, question: q)
+        let paths = ["d1", "a.txt", "b.txt", "c.txt"].map { url.appendingPathComponent($0).path }
+
+        XCTAssertTrue(trash.removeMultiple(paths: paths))
+        XCTAssertEqual(q.asked, ["remove 1 dir and 3 files?"])
+    }
+
     // MARK: - Preserve Root
 
     /// `--preserve-root` (the default) refuses the filesystem root; turning it off
@@ -1399,8 +1448,22 @@ final class FileManagerTests: CWDRestoringTestCase {
 
 final class CommandParsingTests: XCTestCase {
 
-    private func config(_ args: [String]) throws -> Trash.Config {
-        try Command.parse(args).parseArgs()
+    /// Parses with an explicit (empty by default) environment so results don't
+    /// depend on RMTRASH_INTERACTIVE_MODE in the developer's shell.
+    private func config(_ args: [String], env: [String: String] = [:]) throws -> Trash.Config {
+        try Command.parse(args).parseArgs(environment: env)
+    }
+
+    func testEnvironmentProvidesDefaultInteractiveMode() throws {
+        XCTAssertEqual(try config(["x"], env: ["RMTRASH_INTERACTIVE_MODE": "always"]).interactiveMode, .always)
+        XCTAssertEqual(try config(["x"], env: ["RMTRASH_INTERACTIVE_MODE": "once"]).interactiveMode, .once)
+        // Explicit flags win over the environment.
+        XCTAssertEqual(try config(["-I", "x"], env: ["RMTRASH_INTERACTIVE_MODE": "always"]).interactiveMode, .once)
+        XCTAssertEqual(try config(["-f", "x"], env: ["RMTRASH_INTERACTIVE_MODE": "always"]).interactiveMode, .never)
+    }
+
+    func testInvalidEnvironmentValueFallsBackToNever() throws {
+        XCTAssertEqual(try config(["x"], env: ["RMTRASH_INTERACTIVE_MODE": "bogus"]).interactiveMode, .never)
     }
 
     func testMissingOperandThrows() {

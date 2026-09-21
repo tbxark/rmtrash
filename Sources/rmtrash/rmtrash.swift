@@ -56,7 +56,8 @@ struct Command: ParsableCommand {
         }
     }
 
-    func parseArgs() throws -> Trash.Config {
+    // `environment` is injectable so tests don't depend on the developer's shell.
+    func parseArgs(environment: [String: String] = ProcessInfo.processInfo.environment) throws -> Trash.Config {
         if paths.isEmpty {
             if force {
                 // -f with no operands should succeed quietly
@@ -72,7 +73,17 @@ struct Command: ParsableCommand {
             }
             throw Panic("missing operand\nTry 'rmtrash --help' for more information.")
         }
-        var interactiveMode = Trash.Config.InteractiveMode(rawValue: ProcessInfo.processInfo.environment["RMTRASH_INTERACTIVE_MODE"] ?? "never") ?? .never
+        var interactiveMode = Trash.Config.InteractiveMode.never
+        if let raw = environment["RMTRASH_INTERACTIVE_MODE"] {
+            if let mode = Trash.Config.InteractiveMode(rawValue: raw) {
+                interactiveMode = mode
+            } else {
+                Logger.error("rmtrash: warning: ignoring invalid RMTRASH_INTERACTIVE_MODE '\(raw)' (expected never, once, or always)")
+            }
+        }
+        // Explicit flags override the environment. Precedence between flags is
+        // fixed (-f, then -i, then -I, then --interactive) rather than
+        // "last one wins" as in GNU rm; ArgumentParser does not expose order.
         if force {
             interactiveMode = .never
         } else if interactiveAlways {
@@ -415,30 +426,37 @@ extension Trash {
 // MARK: Permission Check
 extension Trash {
 
+    // GNU rm -I semantics: prompt once when removing recursively, or when more
+    // than three operands are given. Operands are counted as typed (duplicates
+    // count twice), like rm.
     private func promptOnceCheck(paths: [String]) -> Bool {
-        var isDirs = [String: Bool]()
+        var dirCount = 0
+        var fileCount = 0
         for path in paths {
             // Unreadable or missing operands are reported later by removeOne;
             // they don't count toward the prompt.
-            guard let res = try? fileManager.fileType(URL(fileURLWithPath: path)) else {
+            guard let type = try? fileManager.fileType(URL(fileURLWithPath: path)) else {
                 continue
             }
-            isDirs[path] = res == .typeDirectory
+            if type == .typeDirectory {
+                dirCount += 1
+            } else {
+                fileCount += 1
+            }
         }
-        let dirs = isDirs.filter({ $0.value }).keys.map({ $0 })
-        let fileCount = isDirs.filter({ $0.value == false }).count
-        let dirWord = dirs.count == 1 ? "dir" : "dirs"
-        let fileWord = fileCount == 1 ? "file" : "files"
-        switch (dirs.count > 0, fileCount > 0) {
-        case (true, false):
-            return question.ask("recursively remove \(dirs.count) \(dirWord)?")
-        case (false, true):
-            return fileCount <= 3 || question.ask("remove \(fileCount) \(fileWord)?")
-        case (true, true):
-            return question.ask("recursively remove \(dirs.count) \(dirWord) and \(fileCount) \(fileWord)?")
-        case (false, false):
+        let total = dirCount + fileCount
+        guard total > 0, config.recursive || total > 3 else {
             return true
         }
+        var parts: [String] = []
+        if dirCount > 0 {
+            parts.append("\(dirCount) \(dirCount == 1 ? "dir" : "dirs")")
+        }
+        if fileCount > 0 {
+            parts.append("\(fileCount) \(fileCount == 1 ? "file" : "files")")
+        }
+        let verb = config.recursive ? "recursively remove" : "remove"
+        return question.ask("\(verb) \(parts.joined(separator: " and "))?")
     }
 
     // Recursively scans `root`'s subtree, returning the path of the first
