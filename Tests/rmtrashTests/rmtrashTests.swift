@@ -108,7 +108,7 @@ final class RecordingFileManager: FileManagerType {
     }
     func isEmptyDirectory(_ url: URL) -> Bool { real.isEmptyDirectory(url) }
     func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool { false }
-    func fileType(_ url: URL) -> FileAttributeType? { real.fileType(url) }
+    func fileType(_ url: URL) throws -> FileAttributeType? { try real.fileType(url) }
 
     func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
         guard let names = try? real.contentsOfDirectory(atPath: path) else { return }
@@ -304,8 +304,8 @@ struct FileSystemTestUtilities {
                 return urlVol != baseVol
             }
 
-            func fileType(_ url: URL) -> FileAttributeType? {
-                return baseFileManager.fileType(url)
+            func fileType(_ url: URL) throws -> FileAttributeType? {
+                return try baseFileManager.fileType(url)
             }
 
             func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
@@ -482,7 +482,7 @@ final class RmTrashTests: XCTestCase {
 
         let trash = makeTrash(emptyDirs: true, fileManager: fileManager)
         XCTAssertFalse(trash.removeMultiple(paths: [locked.path]))
-        XCTAssertEqual(fileManager.fileType(locked), .typeDirectory)
+        XCTAssertEqual(try fileManager.fileType(locked), .typeDirectory)
     }
 
     func testInteractiveModeOnce() {
@@ -640,8 +640,8 @@ final class RmTrashTests: XCTestCase {
         let file = url.appending(path: "no_such_file")
         let link = url.appending(path: "sym.link")
 
-        XCTAssertNil(fileManager.fileType(file))
-        XCTAssertNil(fileManager.fileType(link))
+        XCTAssertNil(try fileManager.fileType(file))
+        XCTAssertNil(try fileManager.fileType(link))
         XCTAssertNoThrow(try fileManager.createSymbolicLink(at: link, withDestinationURL: file))
 
         fileManager.subpaths(atPath: ".") { link in
@@ -653,9 +653,9 @@ final class RmTrashTests: XCTestCase {
             XCTAssertEqual(sub, "sym.link")
         }
 
-        XCTAssertEqual(fileManager.fileType(link), .typeSymbolicLink)
+        XCTAssertEqual(try fileManager.fileType(link), .typeSymbolicLink)
         XCTAssertTrue(trash.removeMultiple(paths: ["sym.link"]))
-        XCTAssertNil(fileManager.fileType(link))
+        XCTAssertNil(try fileManager.fileType(link))
     }
     
     func testRemoveHardLink() {
@@ -674,8 +674,8 @@ final class RmTrashTests: XCTestCase {
         XCTAssertNoThrow(try fileManager.linkItem(at: originalFile, to: hardLink))
         
         // Both should exist and be regular files
-        XCTAssertEqual(fileManager.fileType(originalFile), .typeRegular)
-        XCTAssertEqual(fileManager.fileType(hardLink), .typeRegular)
+        XCTAssertEqual(try fileManager.fileType(originalFile), .typeRegular)
+        XCTAssertEqual(try fileManager.fileType(hardLink), .typeRegular)
         
         // Both should have the same content
         XCTAssertEqual(try? Data(contentsOf: originalFile), testContent)
@@ -685,8 +685,8 @@ final class RmTrashTests: XCTestCase {
         XCTAssertTrue(trash.removeMultiple(paths: ["hardlink.txt"]))
         
         // Hard link should be gone, but original file should still exist
-        XCTAssertNil(fileManager.fileType(hardLink))
-        XCTAssertEqual(fileManager.fileType(originalFile), .typeRegular)
+        XCTAssertNil(try fileManager.fileType(hardLink))
+        XCTAssertEqual(try fileManager.fileType(originalFile), .typeRegular)
         XCTAssertEqual(try? Data(contentsOf: originalFile), testContent)
     }
     
@@ -706,15 +706,15 @@ final class RmTrashTests: XCTestCase {
         XCTAssertNoThrow(try fileManager.createSymbolicLink(at: symlink, withDestinationURL: targetFile))
         
         // Verify types
-        XCTAssertEqual(fileManager.fileType(targetFile), .typeRegular)
-        XCTAssertEqual(fileManager.fileType(symlink), .typeSymbolicLink)
+        XCTAssertEqual(try fileManager.fileType(targetFile), .typeRegular)
+        XCTAssertEqual(try fileManager.fileType(symlink), .typeSymbolicLink)
         
         // Remove symbolic link (should behave like rm - only remove the link, not the target)
         XCTAssertTrue(trash.removeMultiple(paths: ["symlink.txt"]))
         
         // Symbolic link should be gone, but target file should still exist
-        XCTAssertNil(fileManager.fileType(symlink))
-        XCTAssertEqual(fileManager.fileType(targetFile), .typeRegular)
+        XCTAssertNil(try fileManager.fileType(symlink))
+        XCTAssertEqual(try fileManager.fileType(targetFile), .typeRegular)
         XCTAssertEqual(try? Data(contentsOf: targetFile), testContent)
     }
 
@@ -771,6 +771,25 @@ final class RmTrashTests: XCTestCase {
         XCTAssertTrue(trashForce.removeMultiple(paths: ["./nonexistent.txt"]))
     }
 
+    /// `-f` only silences "does not exist". A file that cannot be stat'ed for
+    /// another reason (here: unsearchable parent) is a failure with or without
+    /// `-f`, matching rm (RF-002 regression).
+    func testPermissionDeniedIsReportedEvenWithForce() throws {
+        try XCTSkipIf(getuid() == 0, "root bypasses permission bits")
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+
+        let parent = url.appendingPathComponent("p")
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        let child = parent.appendingPathComponent("f")
+        fileManager.createFile(atPath: child.path, contents: nil, attributes: nil)
+        chmod(parent.path, 0)
+        defer { chmod(parent.path, 0o755) }
+
+        XCTAssertFalse(makeTrash(force: false, fileManager: fileManager).removeMultiple(paths: [child.path]))
+        XCTAssertFalse(makeTrash(force: true, fileManager: fileManager).removeMultiple(paths: [child.path]))
+    }
+
     // MARK: - Interactive Directory Removal
 
     /// Building block for the interactive-removal specs below: a directory with
@@ -804,7 +823,7 @@ final class RmTrashTests: XCTestCase {
 
         XCTAssertTrue(trash.removeMultiple(paths: [dirPath]))
         XCTAssertEqual(Set(mock.removed), ["a.txt", "b.txt", "c.txt", "dir"])
-        XCTAssertNil(mock.fileType(URL(fileURLWithPath: dirPath)))
+        XCTAssertNil(try mock.fileType(URL(fileURLWithPath: dirPath)))
     }
 
     /// Accuracy: if any item cannot be removed, the operation reports failure
@@ -892,11 +911,11 @@ final class RmTrashTests: XCTestCase {
 
         let guarded = makeTrash(recursive: true, preserveRoot: true, fileManager: mock)
         XCTAssertFalse(guarded.removeMultiple(paths: [dir.path]))
-        XCTAssertEqual(mock.fileType(dir), .typeDirectory)
+        XCTAssertEqual(try mock.fileType(dir), .typeDirectory)
 
         let unguarded = makeTrash(recursive: true, preserveRoot: false, fileManager: mock)
         XCTAssertTrue(unguarded.removeMultiple(paths: [dir.path]))
-        XCTAssertNil(mock.fileType(dir))
+        XCTAssertNil(try mock.fileType(dir))
     }
 
     // MARK: - Protected Operands Tests
@@ -964,9 +983,9 @@ final class RmTrashTests: XCTestCase {
         XCTAssertTrue(trash.removeMultiple(paths: ["./link3.link"]))
         
         // Verify the chain is broken but other links remain
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("link3.link")))
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("link2.link")), .typeSymbolicLink)
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("target.txt")), .typeRegular)
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("link3.link")))
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("link2.link")), .typeSymbolicLink)
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("target.txt")), .typeRegular)
     }
     
     func testCircularSymbolicLinks() {
@@ -981,8 +1000,8 @@ final class RmTrashTests: XCTestCase {
         
         // Should be able to remove circular links
         XCTAssertTrue(trash.removeMultiple(paths: ["./link_a.link"]))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("link_a.link")))
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("link_b.link")), .typeSymbolicLink)
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("link_a.link")))
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("link_b.link")), .typeSymbolicLink)
     }
     
     func testBrokenSymbolicLinks() {
@@ -999,9 +1018,9 @@ final class RmTrashTests: XCTestCase {
         XCTAssertTrue(trash.removeMultiple(paths: ["./broken1.link", "./broken2.link", "./broken3.link"]))
         
         // Verify all broken links are removed
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("broken1.link")))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("broken2.link")))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("broken3.link")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("broken1.link")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("broken2.link")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("broken3.link")))
     }
     
     func testMixedLinkScenario() {
@@ -1016,14 +1035,14 @@ final class RmTrashTests: XCTestCase {
         
         // Remove a hard link - original should remain
         XCTAssertTrue(trash.removeMultiple(paths: ["./hard1.txt"]))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("hard1.txt")))
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("original.txt")), .typeRegular)
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("hard2.txt")), .typeRegular)
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("hard1.txt")))
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("original.txt")), .typeRegular)
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("hard2.txt")), .typeRegular)
         
         // Remove a symbolic link - target should remain
         XCTAssertTrue(trash.removeMultiple(paths: ["./sym_to_original.link"]))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("sym_to_original.link")))
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("original.txt")), .typeRegular)
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("sym_to_original.link")))
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("original.txt")), .typeRegular)
     }
     
     func testAbsoluteRelativeLinks() {
@@ -1037,8 +1056,8 @@ final class RmTrashTests: XCTestCase {
         let trash = makeTrash(force: true, recursive: true, fileManager: fileManager)
         
         // Both relative and absolute links should work
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("relative.link")), .typeSymbolicLink)
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("absolute.link")), .typeSymbolicLink)
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("relative.link")), .typeSymbolicLink)
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("absolute.link")), .typeSymbolicLink)
         
         // Remove the target - links become broken but should still be removable
         XCTAssertTrue(trash.removeMultiple(paths: ["./target.txt"]))
@@ -1103,9 +1122,9 @@ final class RmTrashTests: XCTestCase {
 
         XCTAssertFalse(trash.removeMultiple(paths: [rootPath]))
         // Nothing removed: both files and the directory itself remain.
-        XCTAssertEqual(mockFM.fileType(URL(fileURLWithPath: crossVolPath)), .typeRegular)
-        XCTAssertEqual(mockFM.fileType(URL(fileURLWithPath: sameVolPath)), .typeRegular)
-        XCTAssertEqual(mockFM.fileType(URL(fileURLWithPath: rootPath)), .typeDirectory)
+        XCTAssertEqual(try mockFM.fileType(URL(fileURLWithPath: crossVolPath)), .typeRegular)
+        XCTAssertEqual(try mockFM.fileType(URL(fileURLWithPath: sameVolPath)), .typeRegular)
+        XCTAssertEqual(try mockFM.fileType(URL(fileURLWithPath: rootPath)), .typeDirectory)
     }
 
     func testOneFileSystemAllowsSingleVolumeDirectory() throws {
@@ -1138,7 +1157,7 @@ final class RmTrashTests: XCTestCase {
         )
 
         XCTAssertTrue(trash.removeMultiple(paths: [rootPath]))
-        XCTAssertNil(mockFM.fileType(URL(fileURLWithPath: rootPath)))
+        XCTAssertNil(try mockFM.fileType(URL(fileURLWithPath: rootPath)))
     }
     
     func testDeepHierarchyGeneration() {
@@ -1153,7 +1172,7 @@ final class RmTrashTests: XCTestCase {
         
         // Should be able to remove the entire deep hierarchy
         XCTAssertTrue(trash.removeMultiple(paths: ["./root"]))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("root")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("root")))
     }
     
     func testPermissionScenario() {
@@ -1168,15 +1187,15 @@ final class RmTrashTests: XCTestCase {
         
         // Should handle empty directories
         XCTAssertTrue(trash.removeMultiple(paths: ["./empty_dir"]))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("empty_dir")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("empty_dir")))
         
         // Should handle nested empty directories
         XCTAssertTrue(trash.removeMultiple(paths: ["./nested_empty"]))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("nested_empty")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("nested_empty")))
         
         // Should handle broken symbolic links
         XCTAssertTrue(trash.removeMultiple(paths: ["./mixed_content"]))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("mixed_content")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("mixed_content")))
     }
     
     func testLargeFileSystemGeneration() {
@@ -1191,9 +1210,9 @@ final class RmTrashTests: XCTestCase {
         
         // Should handle multiple directories with files
         XCTAssertTrue(trash.removeMultiple(paths: ["./dir0", "./dir1"]))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("dir0")))
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("dir1")))
-        XCTAssertEqual(fileManager.fileType(url.appendingPathComponent("dir2")), .typeDirectory)
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("dir0")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("dir1")))
+        XCTAssertEqual(try fileManager.fileType(url.appendingPathComponent("dir2")), .typeDirectory)
     }
 }
 
@@ -1241,12 +1260,33 @@ final class FileManagerTests: XCTestCase {
         let (fileManager, url) = FileManager.createTempDirectory()
         defer { try? fileManager.removeItem(at: url) }
 
-        XCTAssertNil(fileManager.fileType(url.appendingPathComponent("no_file")))
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("no_file")))
 
         let fileURL = url.appendingPathComponent("temp.txt")
         fileManager.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
-        XCTAssertEqual(fileManager.fileType(fileURL), .typeRegular)
-        XCTAssertEqual(fileManager.fileType(url), .typeDirectory)
+        XCTAssertEqual(try fileManager.fileType(fileURL), .typeRegular)
+        XCTAssertEqual(try fileManager.fileType(url), .typeDirectory)
+    }
+
+    /// `fileType` returns nil only for ENOENT; other stat failures are thrown
+    /// with a POSIX description so callers can tell them apart.
+    func testFileTypeDistinguishesMissingFromUnreadable() throws {
+        try XCTSkipIf(getuid() == 0, "root bypasses permission bits")
+        let (fileManager, url) = FileManager.createTempDirectory()
+        defer { try? fileManager.removeItem(at: url) }
+
+        let parent = url.appendingPathComponent("p")
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        let child = parent.appendingPathComponent("f")
+        fileManager.createFile(atPath: child.path, contents: nil, attributes: nil)
+        chmod(parent.path, 0)
+        defer { chmod(parent.path, 0o755) }
+
+        XCTAssertNil(try fileManager.fileType(url.appendingPathComponent("missing")))
+        XCTAssertThrowsError(try fileManager.fileType(child)) { error in
+            XCTAssertEqual(error.posixCode, EACCES)
+            XCTAssertEqual(error.rmDescription, "Permission denied")
+        }
     }
     
     func testCrossMountPointDetection() throws {

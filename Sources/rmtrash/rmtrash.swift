@@ -108,7 +108,10 @@ public protocol FileManagerType {
     // dictate the comparison is against the command-line argument, not the CWD.
     func isCrossMountPoint(_ url: URL, against base: URL) throws -> Bool
 
-    func fileType(_ url: URL) -> FileAttributeType?
+    // Returns nil only when the path does not exist (ENOENT). Any other failure
+    // (permission denied, not a directory, ...) is thrown so it can be reported
+    // instead of being mistaken for "no such file".
+    func fileType(_ url: URL) throws -> FileAttributeType?
     func subpaths(atPath path: String, enumerator handler: (String) -> Bool)
 }
 
@@ -161,14 +164,13 @@ extension FileManager: FileManagerType {
         return true
     }
 
-    public func fileType(_ url: URL) -> FileAttributeType? {
-        guard let attr = try? self.attributesOfItem(atPath: url.path) else {
+    public func fileType(_ url: URL) throws -> FileAttributeType? {
+        do {
+            let attr = try self.attributesOfItem(atPath: url.path)
+            return attr[.type] as? FileAttributeType
+        } catch let error where error.posixCode == ENOENT {
             return nil
         }
-        guard let fileType = attr[.type] as? FileAttributeType else {
-            return nil
-        }
-        return  fileType
     }
 
     public func subpaths(atPath path: String, enumerator handler: (String) -> Bool) {
@@ -215,6 +217,40 @@ public struct Logger {
 }
 
 // MARK: - Error
+extension Error {
+    /// The POSIX errno behind this error, if one can be determined. Foundation
+    /// wraps filesystem failures in CocoaError with the POSIX error underneath.
+    var posixCode: Int32? {
+        let ns = self as NSError
+        if ns.domain == NSPOSIXErrorDomain {
+            return Int32(ns.code)
+        }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return underlying.posixCode
+        }
+        if ns.domain == NSCocoaErrorDomain {
+            switch ns.code {
+            case NSFileNoSuchFileError, NSFileReadNoSuchFileError:
+                return ENOENT
+            case NSFileReadNoPermissionError, NSFileWriteNoPermissionError:
+                return EACCES
+            default:
+                return nil
+            }
+        }
+        return nil
+    }
+
+    /// rm-style short description ("Permission denied") when a POSIX errno is
+    /// known; otherwise Foundation's localized description.
+    var rmDescription: String {
+        if let code = posixCode {
+            return String(cString: strerror(code))
+        }
+        return localizedDescription
+    }
+}
+
 public struct Panic: Error, LocalizedError {
     public let message: String
     // LocalizedError derives localizedDescription from errorDescription.
@@ -377,7 +413,9 @@ extension Trash {
     private func promptOnceCheck(paths: [String]) -> Bool {
         var isDirs = [String: Bool]()
         for path in paths {
-            guard let res = fileManager.fileType(URL(fileURLWithPath: path)) else {
+            // Unreadable or missing operands are reported later by removeOne;
+            // they don't count toward the prompt.
+            guard let res = try? fileManager.fileType(URL(fileURLWithPath: path)) else {
                 continue
             }
             isDirs[path] = res == .typeDirectory
@@ -412,7 +450,7 @@ extension Trash {
                     crossed = true
                     return false
                 }
-                if fileManager.fileType(subURL) == .typeDirectory {
+                if (try? fileManager.fileType(subURL)) == .typeDirectory {
                     walk(subURL)
                 }
                 return !crossed
@@ -433,8 +471,16 @@ extension Trash {
 
         let url = URL(fileURLWithPath: path)
 
-        // file exists check
-        guard let fileType = fileManager.fileType(url) else {
+        // file exists check. Only "does not exist" is silenced by -f; any other
+        // stat failure (permission denied, not a directory, ...) is reported
+        // regardless of -f, matching rm.
+        let maybeFileType: FileAttributeType?
+        do {
+            maybeFileType = try fileManager.fileType(url)
+        } catch {
+            throw canNotRemovePanic(path: path, err: error.rmDescription)
+        }
+        guard let fileType = maybeFileType else {
             if !config.force {
                 throw canNotRemovePanic(path: path, err: "No such file or directory")
             }
