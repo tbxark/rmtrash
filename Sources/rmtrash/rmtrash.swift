@@ -269,7 +269,13 @@ public struct CommandLineQuestion: Question {
     public init() {}
 
     public func ask(_ message: String) -> Bool {
-        print("\(message) (y/n) ", terminator: "")
+        // Prompts go to stderr, like rm, so they are visible even when stdout is
+        // redirected and never pollute stdout for scripts. Flush explicitly: the
+        // prompt has no trailing newline, so buffering could otherwise hold it
+        // back until after the user is expected to answer.
+        var stdError = Logger.StdError()
+        print("\(message) (y/n) ", terminator: "", to: &stdError)
+        fflush(stderr)
         guard let answer = readLine() else {
             return false
         }
